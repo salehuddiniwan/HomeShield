@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Environment variables (contains secrets!)
+.env
+
+# Database
+*.db
+*.sqlite3
+
+# YOLOv8 model weights (too large for GitHub — up to 136MB each)
+*.pt
+*.onnx
+*.engine
+
+# Models folder
+models/
+
+# Snapshots (event images)
+static/snapshots/*.jpg
+static/snapshots/*.png
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+
+# Jupyter
+.ipynb_checkpoints/

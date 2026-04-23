@@ -1,0 +1,34 @@
+# ── Core ──────────────────────────────────────────────────────────────────────
+flask>=3.0.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+python-dotenv>=1.0.0
+twilio>=9.0.0
+
+# ── GPU inference (PyTorch + CUDA) ────────────────────────────────────────────
+# Install the CUDA-enabled build matching your driver. Examples:
+#
+#   CUDA 12.1  (most modern cards, RTX 30/40xx, A/H series):
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#
+#   CUDA 11.8  (older cards, GTX 10/16/20xx):
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#
+#   Apple Silicon (MPS):
+#     pip install torch torchvision          # standard PyPI build includes MPS
+#
+#   CPU-only fallback:
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#
+# The package below is a placeholder; replace with the correct index-url above.
+torch>=2.2.0
+torchvision>=0.17.0
+
+# ── Detection & pose ──────────────────────────────────────────────────────────
+ultralytics>=8.2.0        # YOLOv8 — batched GPU inference + FP16 support
+mediapipe>=0.10.9         # CPU pose estimation (parallelised via thread pool)
+
+# ── Optional: OpenCV with CUDA support ───────────────────────────────────────
+# For GPU-accelerated BGR→RGB colour conversion. Build from source or use:
+#   pip install opencv-contrib-python  (CPU only, works fine)
+#   OR build opencv with CUDA: https://docs.opencv.org/4.x/d6/d15/tutorial_building_tegra_cuda.html
