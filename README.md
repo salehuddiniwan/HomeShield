@@ -78,8 +78,8 @@ python --version
 ### 2. Clone and create a venv
 
 ```bash
-git clone https://github.com/<your-user>/homeshield.git
-cd homeshield
+git clone https://github.com/salehuddiniwan/HomeShield.git
+cd HomeShield
 
 # If you skipped the conda step above, create a plain venv:
 python -m venv venv
@@ -184,15 +184,65 @@ Source: 0
 
 If you have multiple webcams, try `1`, `2`, etc.
 
-### TP-Link Tapo C200 / C210
-Enable RTSP in the **Tapo app → Camera Settings → Advanced Settings → Camera Account** and set a username + password. Then point HomeShield at the RTSP URL:
+### IP cameras over RTSP (Tapo, VIGI, Hikvision, Dahua, …)
+HomeShield works with any IP camera that exposes an **RTSP** stream. The general form is:
 
 ```
-Source: rtsp://<user>:<password>@<camera-ip>:554/stream1   # high quality
+Source: rtsp://<user>:<password>@<camera-ip>:<port>/<stream-path>
+```
+
+Most consumer cameras use port `554`. Many manufacturers offer a high-quality main stream and a lower-bitrate sub-stream — **the sub-stream is strongly recommended for 24/7 monitoring** because it stays well within the GPU / CPU budget when you're running multiple cameras side-by-side. Below are the URL patterns for the brands HomeShield has been validated against.
+
+#### TP-Link Tapo (C100, C200, C210, C220, C310, C320WS, etc.)
+1. Open the **Tapo app → your camera → Camera Settings → Advanced Settings → Camera Account**.
+2. Toggle **Camera Account** on and set a username + password (this is the RTSP credential, separate from your Tapo login).
+3. Use the URL:
+
+```
+Source: rtsp://<user>:<password>@<camera-ip>:554/stream1   # high quality (2K / 1080p)
 Source: rtsp://<user>:<password>@<camera-ip>:554/stream2   # lower quality, lower bandwidth
 ```
 
-`stream2` is recommended for 24/7 monitoring — it stays well within the GPU budget when you're running multiple cameras.
+#### TP-Link VIGI (C300, C400, C540, NVR channels)
+1. In the **VIGI Security Manager** (or web UI) → **Settings → Network → Advanced → RTSP** — make sure RTSP is enabled and note the port (default `554`).
+2. Create an ONVIF / RTSP account under **Settings → System → User Management**.
+3. URL pattern:
+
+```
+Source: rtsp://<user>:<password>@<camera-ip>:554/stream1   # main stream
+Source: rtsp://<user>:<password>@<camera-ip>:554/stream2   # sub stream
+```
+
+For VIGI NVR channels, append the channel number, e.g. `…/stream1?channel=2`.
+
+#### Hikvision (DS-2CD…, Ezviz under the hood)
+1. Web UI → **Configuration → Network → Advanced Settings → Integration Protocol** — enable **ONVIF** and create an ONVIF user, or use the admin account.
+2. Web UI → **Configuration → System → Security → Authentication** — set **RTSP Authentication** to `digest/basic`.
+3. URL pattern:
+
+```
+Source: rtsp://<user>:<password>@<camera-ip>:554/Streaming/Channels/101   # main stream, ch 1
+Source: rtsp://<user>:<password>@<camera-ip>:554/Streaming/Channels/102   # sub stream, ch 1
+```
+
+For multi-channel NVRs, the channel encoding is `<channel><stream>` — e.g. `201` = channel 2 main, `202` = channel 2 sub.
+
+#### Dahua (IPC-HDW…, Lorex, Amcrest rebrands)
+1. Web UI → **Setup → Network → Connection → RTSP** — confirm port (default `554`).
+2. Create or reuse an admin / operator account under **Setup → System → Account**.
+3. URL pattern:
+
+```
+Source: rtsp://<user>:<password>@<camera-ip>:554/cam/realmonitor?channel=1&subtype=0   # main stream
+Source: rtsp://<user>:<password>@<camera-ip>:554/cam/realmonitor?channel=1&subtype=1   # sub stream
+```
+
+`subtype=0` is the main stream, `subtype=1` is the sub stream. Change `channel=` for NVR channels.
+
+#### Generic ONVIF / other brands
+If your camera isn't listed above, check the manufacturer's docs for "RTSP URL" or "ONVIF stream URI". Tools like **ONVIF Device Manager** or **VLC → Media → Open Network Stream** can probe a camera and reveal its working RTSP path. Once you have the URL, paste it into HomeShield's **Live feeds → Add camera → Source** field exactly as-is.
+
+> 💡 **TCP vs UDP:** if the stream connects but stutters or freezes, OpenCV may be defaulting to UDP transport on a lossy network. You can force TCP by exporting `OPENCV_FFMPEG_CAPTURE_OPTIONS=rtsp_transport;tcp` before launching HomeShield.
 
 ### Android phone as camera (DroidCam, IP Webcam)
 Both apps expose a phone's camera as a network stream:
@@ -271,36 +321,11 @@ All knobs live in **Settings** and apply live without restarting cameras (only s
 
 ## 🏗️ Architecture
 
-```
-                   ┌─────────────────────────────────────┐
-                   │         Flask + Jinja2 UI          │
-                   │  (MJPEG iframe + SSE event stream) │
-                   └────────────┬────────────────────────┘
-                                │
-                  ┌─────────────┴──────────────┐
-                  │       homeshield.server    │
-                  │  /api/...   /stream/<cam>  │
-                  └──────┬───────────────┬─────┘
-                         │               │
-                ┌────────▼─────┐   ┌─────▼──────┐
-                │ CameraManager│   │  EventBus  │
-                │ (cameras.py) │   │ (events.py)│
-                └────┬────┬────┘   └─────┬──────┘
-                     │    │              │
-        ┌────────────┘    └──────────┐   │  daemon thread
-        ▼                            ▼   ▼
-┌─────────────────┐         ┌─────────────────┐
-│  Camera worker  │   ...   │  Camera worker  │ ── JPEG encode
-│ (pipeline.py)   │         │ (pipeline.py)   │ ── SQLite write
-│  capture loop   │         │  capture loop   │ ── SSE broadcast
-└──┬──┬──┬────────┘         └─────────────────┘
-   │  │  │
-   │  │  └─► Face daemon thread (InsightFace, every 5th frame)
-   │  └────► Fire YOLO         (every 2nd frame)
-   └───────► Pose YOLO + Fall FSM (every frame)
+HomeShield is a single Flask process that runs one **CameraManager** with one worker thread per camera. Every worker shares a single set of YOLO / InsightFace models on the GPU and publishes results to an async **EventBus** that handles SQLite writes, snapshot encoding, and Server-Sent Events to the browser. The full UML component diagram is below:
 
-   All workers share ONE set of models loaded on GPU (Models singleton).
-```
+![HomeShield Component Diagram](UML_Diagrams/PNG/Component%20Diagram.png)
+
+The matching PlantUML source lives in [`UML_Diagrams/pump/02_component_diagram.puml`](UML_Diagrams/pump/02_component_diagram.puml), and additional UML views (use case, class, object, activity, sequence, deployment, and the three FSM diagrams) are in [`UML_Diagrams/PNG/`](UML_Diagrams/PNG/).
 
 Key design choices:
 - **Per-camera worker threads** share one set of YOLO / ONNX models on the GPU. Adding a camera does not duplicate VRAM.
@@ -331,8 +356,9 @@ FYP/
 │   ├── detect_fire.py
 │   └── best.pt                     #   custom-trained weights
 │
-├── Face_Detection/                 # InsightFace reference + bundled wheel
+├── Face_Detection/                 # InsightFace reference + bundled wheels
 │   ├── face_recognizer.py
+│   ├── insightface-0.7.3-cp310-cp310-win_amd64.whl
 │   └── insightface-0.7.3-cp311-cp311-win_amd64.whl
 │
 ├── Icon/                           # Dashboard SVG icons
@@ -342,11 +368,17 @@ FYP/
 │   ├── Fire.svg
 │   ├── Face.svg
 │   ├── Camera.svg
+│   ├── Register.svg
 │   └── Notifcation.svg
+│
+├── UML_Diagrams/                   # PlantUML sources + rendered PNGs
+│   ├── puml/                       #   .puml source files (use case, class, FSMs, …)
+│   └── PNG/                        #   rendered diagrams based on .puml files
 │
 ├── homeshield/                     # The unified Flask app
 │   ├── __init__.py
 │   ├── server.py                   #   Flask API + MJPEG endpoints + SSE
+│   ├── auth.py                     #   user accounts + login / session middleware
 │   ├── pipeline.py                 #   per-camera pipeline + Models + FaceWorker
 │   ├── cameras.py                  #   multi-camera lifecycle manager
 │   ├── events.py                   #   async EventBus + SQLite log + snapshots
@@ -364,8 +396,10 @@ FYP/
 │
 ├── run_homeshield.py               # Entry point (argparse + create_app)
 ├── requirements.txt                # Pinned, ABI-consistent deps
-├── homeshield.db                   # SQLite event/persons/zones store (created on first run)
-├── events.db                       # Legacy event store (kept for reference)
+├── homeshield.db                   # SQLite event/persons/zones/users store (created on first run)
+├── snapshots/                      # Annotated event JPEGs (gitignored)
+├── person_photos/                  # Enrolment photos for known persons (gitignored)
+├── intruder_photos/                # Auto-logged unknown-face snapshots (gitignored)
 ├── .gitignore
 ├── .gitattributes
 └── README.md                       # ← you are here
@@ -375,11 +409,13 @@ FYP/
 
 ## 🔐 Privacy & security
 
-- **All inference runs locally.** No frames, embeddings, or events leave your machine. There is no cloud component, no telemetry, and no third-party API calls during detection.
+- **All inference runs locally.** No frames, embeddings, or events ever leave your machine. There is no cloud component, no telemetry, and no third-party API calls during detection — HomeShield only touches the network to pull RTSP/HTTP streams from cameras you explicitly add.
+- **Built-in user authentication.** The dashboard ships with a login layer (`homeshield/auth.py`) backed by hashed passwords in the local SQLite DB. On first run you'll be prompted to create the initial admin account; every API and stream endpoint then requires an authenticated session. Change a password from **Account → Settings**, and revoke a leaked session by clearing the `users` / `sessions` rows in `homeshield.db`.
 - **Face embeddings, not photos**, are used for matching at runtime. The 512-dim ArcFace vectors live in the local SQLite DB. Original enrolment photos are kept in `person_photos/` so you can re-enrol after a model swap.
-- **Intruder snapshots** are stored in `intruder_photos/` on disk. Delete them whenever you want — the entry in the UI will disappear.
-- **Network exposure:** by default the server binds to `0.0.0.0:5000`, meaning **anyone on your local network can reach the dashboard.** If that's not what you want, run with `--host 127.0.0.1`. There is no built-in authentication — for remote access, put it behind a reverse proxy with HTTPS + auth (Caddy, nginx + basic auth, Cloudflare Tunnel, Tailscale).
-- **RTSP credentials** for IP cameras are stored in plaintext in the SQLite DB. Treat the DB file accordingly. Anyone with read access to it can pull camera passwords.
+- **Intruder snapshots** are stored in `intruder_photos/` on disk. Delete them whenever you want — the entry in the UI will disappear with them. The same applies to event snapshots in `snapshots/`.
+- **Network exposure.** By default the server binds to `0.0.0.0:5000`, so any authenticated user on your local network can reach the dashboard. To restrict it to the same machine, run with `--host 127.0.0.1`. For remote access, **do not expose port 5000 directly to the public internet** — put HomeShield behind a reverse proxy with HTTPS (Caddy, nginx, Cloudflare Tunnel) or a private network (Tailscale, WireGuard).
+- **RTSP credentials** for IP cameras are stored in plaintext inside the SQLite DB so that camera workers can reconnect after a restart. Treat `homeshield.db` like any other secret file — anyone with read access to it can pull your camera passwords. Back it up to an encrypted volume if you're storing it outside your machine.
+- **Defence in depth.** Make sure your IP cameras themselves use **strong, unique RTSP passwords** (not the default `admin/admin`), keep their firmware up to date, and put them on a VLAN or isolated Wi-Fi SSID that cannot reach the rest of your LAN. HomeShield is only as secure as the cameras feeding it.
 
 ---
 
@@ -398,7 +434,7 @@ Indicative numbers on an **RTX-class GPU + Ryzen / Intel desktop CPU**, measured
 
 Bottlenecks, in practice:
 - **Face inference on CPU** is the single biggest performance cliff — keep it on GPU or off entirely.
-- **RTSP decode** (especially the Tapo `stream1` 2K mode) eats a surprising amount of CPU. Prefer `stream2` for 24/7 use.
+- **RTSP decode** (especially 2K / 4K main streams on Tapo, Hikvision, or Dahua) eats a surprising amount of CPU. Prefer the **sub-stream** for 24/7 use across all brands.
 - **Disk I/O** never blocks the capture loop because event publishing is fully async.
 
 ---
@@ -418,7 +454,7 @@ Use the bundled wheel: `pip install Face_Detection/insightface-0.7.3-cp311-cp311
 HomeShield only lists files in `Fall_Detection/weights/` whose names end in `-pose.pt`. Heavy `x` variants exceed GitHub's per-file limit and are excluded by `.gitignore`. Download them from <https://github.com/ultralytics/assets/releases> or train your own.
 
 **RTSP camera connects but stutters**
-You're probably on `stream1` (2K). Switch to `stream2` (lower bitrate). If still bad, check that your CPU isn't pinned at 100% from H.264 decode.
+You're probably on the main / high-quality stream. Switch to the camera's sub-stream (e.g. `/stream2` on Tapo/VIGI, `/Streaming/Channels/102` on Hikvision, `subtype=1` on Dahua). If it still stutters, try forcing TCP transport via `OPENCV_FFMPEG_CAPTURE_OPTIONS=rtsp_transport;tcp`, and check that your CPU isn't pinned at 100% from H.264/H.265 decode.
 
 **Phone (DroidCam / IP Webcam) won't connect**
 Both devices must be on the **same Wi-Fi network** (not Wi-Fi vs guest network, not cellular). Open the URL in a browser first to confirm the stream is reachable, then paste it into HomeShield.
@@ -434,26 +470,6 @@ Lower the **fall sensitivity** in Settings, or raise the descent-velocity thresh
 
 ---
 
-## 🗺️ Development roadmap
-
-**Near-term**
-- Push notifications (Telegram / Pushover / NTFY) for fall and intruder alerts.
-- Multi-user authentication on the dashboard with per-user camera ACLs.
-- Timeline / day-view of events with filtering.
-- Export an event window as a clip (with annotated frames stitched into MP4).
-
-**Mid-term**
-- Audio anomaly detection (glass break, smoke alarm, scream classification) as a fourth detector lane.
-- ONNX-only deployment path so the same dashboard can run on lighter hardware (Jetson, Raspberry Pi 5 + Coral).
-- Replace the per-class cooldown with a smarter event deduplicator (e.g. event-window clustering across cameras).
-- First-class Docker compose with GPU runtime and a single `up` command.
-
-**Stretch**
-- Federated person gallery so multiple HomeShield nodes on a LAN share the registered Persons / Intruder DB.
-- Activity classifier (cooking, sleeping, watching TV) for elderly-care use cases.
-
----
-
 ## 📄 License
 
 This project is released under the **MIT License**. See `LICENSE` (or the header in `run_homeshield.py`) for the full text.
@@ -462,8 +478,6 @@ Third-party model weights and libraries retain their own licenses:
 - **Ultralytics YOLO** — AGPL-3.0 (commercial use requires an Ultralytics enterprise license).
 - **InsightFace** — MIT.
 - **PyTorch, OpenCV, Flask, NumPy, SciPy, Shapely** — their respective open-source licenses.
-
-If you intend to deploy HomeShield commercially, audit Ultralytics' AGPL terms first.
 
 ---
 

@@ -1,0 +1,81 @@
+@startuml HomeShield Use Case Diagram
+title HomeShield - Use Case Diagram
+
+skinparam actorStyle awesome
+skinparam packageStyle rectangle
+skinparam usecaseBackgroundColor #FEFCE8
+skinparam actorBackgroundColor #E0F2FE
+
+left to right direction
+
+actor "Admin\n(homeowner)" as Admin
+actor "Guest\n(family / housemate)" as Guest
+actor "IP Camera" as IpCam <<external system>>
+actor "Webcam /\nPhone Camera" as Webcam <<external system>>
+
+rectangle "HomeShield Dashboard" {
+    usecase "UC-01\nLog in / Log out"               as UC01
+    usecase "UC-02\nChange own password"            as UC02
+    usecase "UC-03\nView live camera feeds"         as UC03
+    usecase "UC-04\nView real-time event log"       as UC04
+    usecase "UC-05\nView annotated event snapshot"  as UC05
+
+    usecase "UC-06\nAdd / Remove camera"            as UC06
+    usecase "UC-07\nRegister family member\n(Person)" as UC07
+    usecase "UC-08\nDelete person"                  as UC08
+    usecase "UC-09\nDraw Safe / Danger zone"        as UC09
+    usecase "UC-10\nDelete zone"                    as UC10
+
+    usecase "UC-11\nReview / dismiss intruder"      as UC11
+    usecase "UC-12\nPromote intruder to person"     as UC12
+
+    usecase "UC-13\nManage users\n(create, delete, role)" as UC13
+    usecase "UC-14\nChange detection settings\n(hot-reload)" as UC14
+    usecase "UC-15\nStart / Stop the system"        as UC15
+}
+
+' --- Guest can do read-only things ---
+Guest --> UC01
+Guest --> UC02
+Guest --> UC03
+Guest --> UC04
+Guest --> UC05
+
+' --- Admin can do everything ---
+Admin --> UC01
+Admin --> UC02
+Admin --> UC03
+Admin --> UC04
+Admin --> UC05
+Admin --> UC06
+Admin --> UC07
+Admin --> UC08
+Admin --> UC09
+Admin --> UC10
+Admin --> UC11
+Admin --> UC12
+Admin --> UC13
+Admin --> UC14
+Admin --> UC15
+
+' --- External camera actors ---
+IpCam   ..> UC03 : "RTSP stream"
+Webcam  ..> UC03 : "HTTP / device"
+
+' --- Include relationships (UC-12 reuses person creation) ---
+UC12 ..> UC07 : <<include>>
+
+' --- Notes ---
+note right of UC14
+  Toggles: fall_enabled,
+  fire_enabled, face_enabled.
+  Thresholds apply live without
+  restarting any camera.
+end note
+
+note bottom of UC09
+  Safe zones  -> suppress fall alerts
+  Danger zones -> alert when child enters
+end note
+
+@enduml

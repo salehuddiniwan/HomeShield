@@ -3,20 +3,25 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
+import secrets
 import time
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 from flask import (Flask, Response, abort, jsonify, render_template, request,
-                   send_from_directory)
+                   send_from_directory, session)
 
+from .auth import (ROLE_ADMIN, ROLE_GUEST, UserStore, login_session,
+                   logout_session, require_admin, require_login,
+                   session_must_change, session_role, session_user_id)
 from .cameras import CameraManager
 from .db import init_db, write_conn
 from .events import Event, EventBus
 from .persons import IntruderStore, PersonStore
 from .pipeline import Models, list_fire_models, list_pose_models
-from .reid import ReIDStore
 from .settings import SettingsStore
 from .zones import ZoneStore
 
@@ -25,13 +30,10 @@ from .zones import ZoneStore
 
 _INT_KEYS = ("inactivity_seconds", "alert_cooldown", "yolo_imgsz",
              "process_fps", "fire_cooldown", "intruder_cooldown",
-             "fire_every_n", "face_every_n", "reid_every_n")
+             "fire_every_n", "face_every_n")
 _FLOAT_KEYS = ("fall_threshold", "yolo_confidence", "fire_confidence",
-               "face_match_threshold", "reid_match_threshold",
-               "reid_ttl_seconds", "reid_handoff_cooldown",
-               "reid_reembed_interval")
-_BOOL_KEYS = ("use_fp16", "fall_enabled", "fire_enabled", "face_enabled",
-              "reid_enabled")
+               "face_match_threshold")
+_BOOL_KEYS = ("use_fp16", "fall_enabled", "fire_enabled", "face_enabled")
 
 
 def _coerce_settings(data: dict[str, Any]) -> dict[str, Any]:
@@ -76,20 +78,33 @@ def create_app(*, db_path: str = "homeshield.db",
     )
     app.config["JSON_SORT_KEYS"] = False
 
+    # ---- session / auth config ----
+    secret = os.environ.get("HOMESHIELD_SECRET")
+    if not secret:
+        secret = secrets.token_hex(32)
+        print("[server] HOMESHIELD_SECRET not set; using an ephemeral key "
+              "(sessions will not survive a restart)")
+    app.secret_key = secret
+    app.config.update(
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        # Set HOMESHIELD_COOKIE_SECURE=1 when behind HTTPS.
+        SESSION_COOKIE_SECURE=os.environ.get("HOMESHIELD_COOKIE_SECURE") == "1",
+        PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+    )
+
+    user_store = UserStore(db_path)
+
     settings = SettingsStore(db_path)
     bus = EventBus(db_path=db_path, snapshot_dir=snap_path)
     person_store = PersonStore(db_path=db_path, photos_dir=person_dir)
     intruder_store = IntruderStore(db_path=db_path, photos_dir=intruder_dir)
     zone_store = ZoneStore(db_path=db_path)
     models = Models(settings=settings)
-    reid_store = ReIDStore(
-        match_threshold=float(settings.get("reid_match_threshold", 0.65)),
-        ttl_seconds=float(settings.get("reid_ttl_seconds", 120.0)),
-    )
     manager = CameraManager(
         db_path=db_path, models=models, settings=settings, bus=bus,
         person_store=person_store, intruder_store=intruder_store,
-        zone_store=zone_store, reid_store=reid_store,
+        zone_store=zone_store,
     )
 
     if auto_start:
@@ -102,25 +117,167 @@ def create_app(*, db_path: str = "homeshield.db",
 
     @app.route("/")
     def index():
+        # The page itself is public: it always renders the shell, then the
+        # client-side JS calls /api/me and either shows the login overlay
+        # or the dashboard depending on the session.
         return render_template("index.html")
+
+    # ===== Authentication ===============================================
+
+    def _user_public(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "user_id": row["user_id"],
+            "username": row["username"],
+            "role": row["role"],
+            "must_change_password": bool(row.get("must_change", 0)),
+        }
+
+    @app.route("/api/login", methods=["POST"])
+    def api_login():
+        data = request.get_json(silent=True) or {}
+        username = str(data.get("username", "")).strip()
+        password = str(data.get("password", ""))
+        if not username or not password:
+            return jsonify({"error": "username and password are required"}), 400
+        row = user_store.verify(username, password)
+        if row is None:
+            # Same response for unknown user and wrong password.
+            return jsonify({"error": "invalid credentials"}), 401
+        login_session(row)
+        return jsonify({"ok": True, **_user_public(row)})
+
+    @app.route("/api/logout", methods=["POST"])
+    def api_logout():
+        logout_session()
+        return jsonify({"ok": True})
+
+    @app.route("/api/me")
+    def api_me():
+        uid = session_user_id()
+        if uid is None:
+            return jsonify({"error": "auth_required"}), 401
+        row = user_store.get(uid)
+        if row is None:
+            # User was deleted while logged in.
+            logout_session()
+            return jsonify({"error": "auth_required"}), 401
+        return jsonify({"ok": True, **_user_public(row)})
+
+    @app.route("/api/change_password", methods=["POST"])
+    def api_change_password():
+        uid = session_user_id()
+        if uid is None:
+            return jsonify({"error": "auth_required"}), 401
+        data = request.get_json(silent=True) or {}
+        new_pw = str(data.get("new_password", ""))
+        # If the user is NOT on a must-change flow, require their current pw.
+        if not session_must_change():
+            current = str(data.get("current_password", ""))
+            row = user_store.get(uid)
+            if row is None:
+                return jsonify({"error": "auth_required"}), 401
+            verified = user_store.verify(row["username"], current)
+            if verified is None:
+                return jsonify({"error": "current password is incorrect"}), 400
+        try:
+            user_store.update_password(uid, new_pw)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        # Refresh session to clear must_change.
+        row = user_store.get(uid)
+        if row is not None:
+            login_session(row)
+        return jsonify({"ok": True})
+
+    # ===== User management (admin only) =================================
+
+    @app.route("/api/users")
+    @require_admin
+    def api_users_list():
+        return jsonify({"users": user_store.list_users()})
+
+    @app.route("/api/users", methods=["POST"])
+    @require_admin
+    def api_users_add():
+        data = request.get_json(silent=True) or {}
+        try:
+            info = user_store.create_user(
+                username=str(data.get("username", "")),
+                password=str(data.get("password", "")),
+                role=str(data.get("role", ROLE_GUEST)),
+                must_change=bool(data.get("must_change_password", False)),
+            )
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        return jsonify({"ok": True, **info})
+
+    @app.route("/api/users/<int:uid>", methods=["DELETE"])
+    @require_admin
+    def api_users_delete(uid: int):
+        if uid == session_user_id():
+            return jsonify({"error": "cannot delete your own account"}), 400
+        try:
+            ok = user_store.delete_user(uid)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        if not ok:
+            return jsonify({"error": "not found"}), 404
+        return jsonify({"ok": True})
+
+    @app.route("/api/users/<int:uid>/role", methods=["POST"])
+    @require_admin
+    def api_users_set_role(uid: int):
+        data = request.get_json(silent=True) or {}
+        role = str(data.get("role", "")).strip().lower()
+        if uid == session_user_id() and role != ROLE_ADMIN:
+            return jsonify({"error": "cannot demote yourself"}), 400
+        try:
+            ok = user_store.update_role(uid, role)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        if not ok:
+            return jsonify({"error": "not found"}), 404
+        return jsonify({"ok": True})
+
+    @app.route("/api/users/<int:uid>/password", methods=["POST"])
+    @require_admin
+    def api_users_set_password(uid: int):
+        data = request.get_json(silent=True) or {}
+        new_pw = str(data.get("password", ""))
+        try:
+            ok = user_store.update_password(uid, new_pw)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        if not ok:
+            return jsonify({"error": "not found"}), 404
+        # Admin-issued resets force the user to pick their own next time.
+        with write_conn(db_path) as conn:
+            conn.execute(
+                "UPDATE users SET must_change = 1 WHERE user_id = ?", (int(uid),)
+            )
+        return jsonify({"ok": True})
 
     # ===== Status & system ==============================================
 
     @app.route("/api/status")
+    @require_login
     def api_status():
         return jsonify(manager.status())
 
     @app.route("/api/system/start", methods=["POST"])
+    @require_admin
     def api_start():
         manager.start()
         return jsonify({"ok": True, "running": manager.is_running()})
 
     @app.route("/api/system/stop", methods=["POST"])
+    @require_admin
     def api_stop():
         manager.stop()
         return jsonify({"ok": True, "running": manager.is_running()})
 
     @app.route("/healthz")
+    @require_login
     def healthz():
         return jsonify({
             "ok": True,
@@ -130,37 +287,19 @@ def create_app(*, db_path: str = "homeshield.db",
                 "fire_loaded": models.fire_model is not None,
                 "face_available": bool(models.face_engine
                                        and models.face_engine.available),
-                "reid_available": bool(models.reid_engine
-                                       and models.reid_engine.available),
                 "device": models.device,
             },
         })
 
-    # ===== ReID =========================================================
-
-    @app.route("/api/reid/identities")
-    def api_reid_identities():
-        """Live cross-camera identities (in-memory; expires after ttl)."""
-        return jsonify({
-            "available": bool(models.reid_engine
-                              and models.reid_engine.available),
-            "match_threshold": reid_store.match_threshold,
-            "ttl_seconds": reid_store.ttl_seconds,
-            "identities": reid_store.list_identities(),
-        })
-
-    @app.route("/api/reid/reset", methods=["POST"])
-    def api_reid_reset():
-        reid_store.reset()
-        return jsonify({"ok": True})
-
     # ===== Cameras ======================================================
 
     @app.route("/api/cameras")
+    @require_login
     def api_cameras_list():
         return jsonify(manager.store.list())
 
     @app.route("/api/cameras", methods=["POST"])
+    @require_admin
     def api_cameras_add():
         data = request.get_json(silent=True) or {}
         cid = manager.add_camera(
@@ -171,11 +310,13 @@ def create_app(*, db_path: str = "homeshield.db",
         return jsonify({"camera_id": cid, "ok": True})
 
     @app.route("/api/cameras/<int:cid>", methods=["DELETE"])
+    @require_admin
     def api_cameras_delete(cid: int):
         manager.delete_camera(cid)
         return jsonify({"ok": True})
 
     @app.route("/api/models")
+    @require_admin
     def api_models():
         return jsonify({
             "pose": list_pose_models(),
@@ -185,6 +326,7 @@ def create_app(*, db_path: str = "homeshield.db",
     # ===== Video / snapshots ============================================
 
     @app.route("/video_feed/<int:cid>")
+    @require_login
     def video_feed(cid: int):
         latest = manager.latest(cid)
         if latest is None:
@@ -204,6 +346,7 @@ def create_app(*, db_path: str = "homeshield.db",
                         mimetype="multipart/x-mixed-replace; boundary=frame")
 
     @app.route("/frame_snap/<int:cid>")
+    @require_admin
     def frame_snap(cid: int):
         latest = manager.latest(cid)
         if latest is None:
@@ -215,17 +358,22 @@ def create_app(*, db_path: str = "homeshield.db",
                         headers={"Cache-Control": "no-store"})
 
     @app.route("/snapshots/<path:fname>")
+    @require_login
     def snapshot_file(fname: str):
         return send_from_directory(snap_path, fname)
 
     @app.route("/person_photos/<path:fname>")
+    @require_admin
     def person_photo(fname: str):
         return send_from_directory(person_dir, fname)
 
     @app.route("/intruder_photos/<path:fname>")
+    @require_admin
     def intruder_photo(fname: str):
         return send_from_directory(intruder_dir, fname)
 
+    # Icons are part of the page chrome (login + dashboard); leave them public
+    # so the login screen can render its logo before the user authenticates.
     icon_dir = (Path(__file__).resolve().parent.parent / "Icon").resolve()
     if icon_dir.is_dir():
         @app.route("/icons/<path:fname>")
@@ -235,16 +383,19 @@ def create_app(*, db_path: str = "homeshield.db",
     # ===== Events =======================================================
 
     @app.route("/api/events")
+    @require_login
     def api_events():
         limit = int(request.args.get("limit", 50))
         etype = request.args.get("type") or None
         return jsonify(bus.list(limit=limit, event_type=etype))
 
     @app.route("/api/events/clear", methods=["POST"])
+    @require_admin
     def api_events_clear():
         return jsonify({"ok": True, "deleted": bus.clear()})
 
     @app.route("/events_stream")
+    @require_login
     def events_stream():
         def gen():
             q = bus.subscribe()
@@ -267,10 +418,12 @@ def create_app(*, db_path: str = "homeshield.db",
     # ===== Zones ========================================================
 
     @app.route("/api/zones")
+    @require_admin
     def api_zones_list():
         return jsonify(zone_store.list_all())
 
     @app.route("/api/zones", methods=["POST"])
+    @require_admin
     def api_zones_add():
         data = request.get_json(silent=True) or {}
         zid = zone_store.add(
@@ -282,6 +435,7 @@ def create_app(*, db_path: str = "homeshield.db",
         return jsonify({"ok": True, "zone_id": zid})
 
     @app.route("/api/zones/<int:zid>", methods=["DELETE"])
+    @require_admin
     def api_zones_delete(zid: int):
         zone_store.delete(zid)
         return jsonify({"ok": True})
@@ -289,6 +443,7 @@ def create_app(*, db_path: str = "homeshield.db",
     # ===== Persons ======================================================
 
     @app.route("/api/persons")
+    @require_admin
     def api_persons():
         return jsonify({
             "face_rec_enabled": bool(models.face_engine
@@ -297,6 +452,7 @@ def create_app(*, db_path: str = "homeshield.db",
         })
 
     @app.route("/api/persons", methods=["POST"])
+    @require_admin
     def api_persons_add():
         data = request.get_json(silent=True) or {}
         name = str(data.get("name", "")).strip()
@@ -328,11 +484,13 @@ def create_app(*, db_path: str = "homeshield.db",
         return jsonify(info)
 
     @app.route("/api/persons/<int:pid>", methods=["DELETE"])
+    @require_admin
     def api_persons_delete(pid: int):
         person_store.delete(pid)
         return jsonify({"ok": True})
 
     @app.route("/api/detect_face/<int:cid>")
+    @require_admin
     def api_detect_face(cid: int):
         latest = manager.latest(int(cid))
         if latest is None:
@@ -360,22 +518,53 @@ def create_app(*, db_path: str = "homeshield.db",
     # ===== Intruders ====================================================
 
     @app.route("/api/intruders")
+    @require_admin
     def api_intruders():
         include = request.args.get("include_dismissed") in ("1", "true", "yes")
         return jsonify(intruder_store.list(include_dismissed=include))
 
     @app.route("/api/intruders/<int:iid>/dismiss", methods=["POST"])
+    @require_admin
     def api_intruders_dismiss(iid: int):
         intruder_store.dismiss(iid)
-        return jsonify(info)
+        return jsonify({"ok": True, "intruder_id": iid})
+
+    @app.route("/api/intruders/<int:iid>/register", methods=["POST"])
+    @require_admin
+    def api_intruders_register(iid: int):
+        data = request.get_json(silent=True) or {}
+        name = str(data.get("name", "")).strip()
+        category = str(data.get("category", "adult"))
+        if not name:
+            return jsonify({"error": "Name required"}), 400
+        rec = intruder_store.get(iid)
+        if rec is None:
+            return jsonify({"error": "Intruder not found"}), 404
+        if rec.get("embedding") is None:
+            return jsonify({"error": "Intruder has no embedding"}), 400
+        info = person_store.add(
+            name=name, category=category,
+            embedding=rec["embedding"],
+            frame_bgr=None, face_bbox=None,
+        )
+        intruder_store.delete(iid)
+        return jsonify({"ok": True, **info})
+
+    @app.route("/api/intruders/<int:iid>", methods=["DELETE"])
+    @require_admin
+    def api_intruders_delete(iid: int):
+        intruder_store.delete(iid)
+        return jsonify({"ok": True})
 
     # ===== Settings =====================================================
 
     @app.route("/api/settings")
+    @require_admin
     def api_settings_get():
         return jsonify(settings.all())
 
     @app.route("/api/settings", methods=["POST"])
+    @require_admin
     def api_settings_post():
         data = _coerce_settings(request.get_json(silent=True) or {})
         out = settings.update(data)

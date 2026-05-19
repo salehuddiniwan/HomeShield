@@ -1,0 +1,254 @@
+@startuml HomeShield Class Diagram
+title HomeShield - Class Diagram
+
+skinparam classBackgroundColor #FFFBEB
+skinparam classBorderColor #92400E
+skinparam class {
+    BackgroundColor<<store>>    #FCE7F3
+    BackgroundColor<<core>>     #DCFCE7
+    BackgroundColor<<server>>   #FEF3C7
+    BackgroundColor<<auth>>     #DBEAFE
+    BackgroundColor<<model>>    #E9D5FF
+    BackgroundColor<<dto>>      #F3F4F6
+}
+
+' ================= Auth / Users =================
+class UserStore <<auth>> {
+    - db_path: str
+    + create_user(username, password, role, must_change): dict
+    + delete_user(user_id): bool
+    + update_role(user_id, role): bool
+    + update_password(user_id, new_password): bool
+    + verify(username, password): dict
+    + count_admins(): int
+    - _ensure_default_admin()
+}
+
+class "Flask session helpers" as SessHelpers <<auth>> {
+    + login_session(user_row)
+    + logout_session()
+    + session_user_id(): int
+    + session_role(): str
+    + require_login(view)
+    + require_admin(view)
+}
+
+' ================= Stores =================
+class SettingsStore <<store>> {
+    - _cache: dict
+    + get(key, default): any
+    + all(): dict
+    + update(partial): dict
+    - _ensure_defaults()
+    - _migrate()
+}
+
+class CameraStore <<store>> {
+    + list(): list
+    + add(name, url, location): int
+    + delete(camera_id)
+}
+
+class PersonStore <<store>> {
+    - _gallery: list<(id, embedding)>
+    - _meta: dict
+    + reload()
+    + list(): list
+    + add(name, embedding, photo_path, category): int
+    + delete(person_id)
+    + gallery(): list<(id, embedding)>
+}
+
+class IntruderStore <<store>> {
+    + reload()
+    + list(): list
+    + add(embedding, photo_path, camera_id, camera_name): int
+    + dismiss(intruder_id)
+    + delete(intruder_id)
+    + register_as_person(intruder_id, name, category): int
+}
+
+class ZoneStore <<store>> {
+    + REF_W = 640
+    + REF_H = 480
+    - _by_camera: dict<int, list>
+    + for_camera(camera_id): list
+    + add(zone_name, camera_id, polygon, zone_type): int
+    + delete(zone_id)
+    + is_in_safe_zone(camera_id, w, h, x, y): bool
+    + danger_zones_for(camera_id, w, h): list
+}
+
+' ================= Detection =================
+class Models <<model>> {
+    + pose_model: YOLO
+    + fire_model: YOLO
+    + face_engine: FaceEngine
+    + device: str
+    + ensure_loaded()
+    + reload()
+}
+
+class FaceEngine <<model>> {
+    + DEFAULT_THRESHOLD = 0.42
+    + available: bool
+    + detect(frame_bgr): list<face>
+    + best_face(frame_bgr): face
+}
+
+class CameraManager <<core>> {
+    - _workers: dict<int, CaptureWorker>
+    - models: Models
+    - settings: SettingsStore
+    + start_all()
+    + stop_all()
+    + start(camera_id)
+    + stop(camera_id)
+    + status(): dict
+}
+
+class CaptureWorker <<core>> {
+    - thread: Thread
+    - latest: LatestFrame
+    + pipeline: CameraPipeline
+    + run()
+    + stop()
+}
+
+class LatestFrame <<core>> {
+    - _jpeg: bytes
+    - _raw: ndarray
+    + set(frame)
+    + jpeg(): bytes
+    + raw(): ndarray
+    + get_blocking(version, timeout)
+}
+
+class CameraPipeline <<core>> {
+    - camera_id: int
+    - camera_name: str
+    - models: Models
+    - settings: SettingsStore
+    - zone_store: ZoneStore
+    - face_worker: FaceWorker
+    - fall_state: FallStateMachine
+    + process_frame(frame): FrameResult
+    - _run_pose(frame, ts, H, W, device, res)
+    - _run_fire(frame, ts, device, res)
+    - _run_face(frame, ts, res)
+    - _emit_person_events(ts, W, H, res)
+}
+
+class FaceWorker <<core>> {
+    - _q: Queue
+    - _latest: list<face>
+    + submit(frame, ts)
+    + latest_faces(): list
+}
+
+class FrameResult <<dto>> {
+    + ts: float
+    + persons: list
+    + fires: list
+    + faces: list
+    + events: list<Event>
+    + fps: float
+    + fall_alert_ids: list
+    + danger_zones: list
+    + safe_zones: list
+}
+
+class FallStateMachine <<core>> {
+    + step(yolo_result, H, W, ts): list<person>
+}
+
+' ================= Events =================
+class Event <<dto>> {
+    + event_id: int
+    + event_type: str
+    + ts: float
+    + camera_id: int
+    + camera_name: str
+    + person_category: str
+    + confidence: float
+    + details: str
+    + snapshot_path: str
+    + bbox: tuple
+    + meta: dict
+    + to_json(): dict
+}
+
+class EventBus <<core>> {
+    - _queue: Queue
+    - _subscribers: list
+    + publish(event, frame)
+    + subscribe(): Queue
+    - _worker()
+}
+
+class Annotator <<core>> {
+    + annotate(frame, result): ndarray
+    + disconnected_placeholder(w, h, text): ndarray
+}
+
+' ================= Server (Flask) =================
+class "FlaskApp\n(server.py)" as FlaskApp <<server>> {
+    + create_app(db_path, snapshot_dir, ...): Flask
+    + /api/login
+    + /api/cameras
+    + /api/events
+    + /events_stream  (SSE)
+    + /video_feed/<cid> (MJPEG)
+    + /api/zones, /api/persons, /api/intruders
+    + /api/settings, /api/users, /api/system/*
+}
+
+' ================= Relationships =================
+FlaskApp --> UserStore
+FlaskApp --> CameraManager
+FlaskApp --> CameraStore
+FlaskApp --> SettingsStore
+FlaskApp --> PersonStore
+FlaskApp --> IntruderStore
+FlaskApp --> ZoneStore
+FlaskApp --> EventBus
+FlaskApp ..> SessHelpers : uses decorators
+
+CameraManager "1" *-- "many" CaptureWorker : spawns
+CaptureWorker "1" *-- "1" CameraPipeline
+CaptureWorker "1" *-- "1" LatestFrame
+
+CameraPipeline --> Models : shared
+CameraPipeline --> SettingsStore
+CameraPipeline --> ZoneStore
+CameraPipeline --> FaceWorker
+CameraPipeline --> FallStateMachine
+CameraPipeline --> EventBus : publish()
+CameraPipeline --> Annotator
+CameraPipeline ..> FrameResult : creates
+
+Models "1" --> "1" FaceEngine
+
+FaceWorker --> Models : face_engine
+FaceWorker --> PersonStore : best_match against gallery
+
+EventBus ..> Event
+EventBus --> "snapshots/, DB"
+
+PersonStore "1" o-- "many" IntruderStore : promote()
+
+note bottom of CameraPipeline
+  Per-frame stages:
+   1. Pose (every frame)
+   2. Fire (every fire_every_n frames)
+   3. Face (every face_every_n frames, async)
+   4. Zone check
+   5. Annotator + EventBus.publish()
+end note
+
+note right of Models
+  Singleton. Loaded once on the GPU.
+  Shared across every CameraPipeline.
+end note
+
+@enduml

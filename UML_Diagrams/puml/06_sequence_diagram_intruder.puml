@@ -1,0 +1,80 @@
+@startuml HomeShield Sequence Diagram - Intruder
+title HomeShield - Sequence Diagram\n"Unknown face appears -> Intruder alert in browser"
+
+skinparam sequenceArrowColor #1E40AF
+skinparam sequenceLifeLineBorderColor #92400E
+skinparam sequenceParticipantBackgroundColor #FEF3C7
+
+actor "User\n(browser)" as User
+participant "Flask Server\n(server.py)" as Server
+participant "CaptureWorker\n(cameras.py)" as Worker
+participant "CameraPipeline\n(pipeline.py)" as Pipeline
+participant "FaceWorker\n(async thread)" as FaceWk
+participant "Models\n(InsightFace ArcFace)" as Models
+participant "PersonStore" as People
+participant "IntruderStore" as Intruders
+participant "EventBus\n(daemon thread)" as EvBus
+database "SQLite\n(homeshield.db)" as DB
+collections "SSE clients" as SSE
+
+== Live capture loop ==
+
+loop every frame
+    Worker -> Pipeline : process_frame(frame)
+    Pipeline -> Pipeline : pose + FSM
+    alt every fire_every_n frames
+        Pipeline -> Models : fire_model.predict()
+        Models --> Pipeline : fire boxes
+    end
+    alt every face_every_n frames
+        Pipeline -> FaceWk : submit(frame, ts) (non-blocking)
+    end
+    Pipeline -> FaceWk : latest_faces()
+    FaceWk --> Pipeline : faces (possibly empty)
+    Pipeline -> Worker : FrameResult (no event yet)
+end
+
+== Unknown face arrives ==
+
+FaceWk -> Models : face_engine.detect(frame)
+Models --> FaceWk : list of {bbox, embedding}
+FaceWk -> People : gallery()  : list<(id, emb)>
+People --> FaceWk : 3 known embeddings
+FaceWk -> FaceWk : best_match(query, gallery)\nresult = (None, score=0.21)
+note right of FaceWk
+  score < threshold (0.42)
+  -> no match -> intruder!
+end note
+
+FaceWk --> Pipeline : face with match_id = None
+Pipeline -> Pipeline : intruder_alert = True
+Pipeline -> Intruders : add(embedding, snapshot,\ncamera_id, camera_name)
+Intruders -> DB : INSERT INTO intruders
+Intruders --> Pipeline : intruder_id
+Pipeline -> Pipeline : Build Event(intruder_detected, ...)
+
+== Async event publication ==
+
+Pipeline -> EvBus : publish(event, frame)
+note right of EvBus
+  publish() returns immediately.
+  The capture loop is NEVER blocked
+  by disk I/O or network.
+end note
+EvBus -> EvBus : enqueue
+EvBus -> EvBus : (daemon thread wakes)
+EvBus -> EvBus : JPEG encode annotated snapshot
+EvBus -> DB : INSERT INTO events
+DB --> EvBus : event_id
+EvBus -> SSE : data: {event_type: 'intruder_detected', ...}
+
+== Browser receives the alert ==
+
+User -> Server : EventSource /events_stream (kept open)
+SSE --> User : new event message
+User -> User : Toast "Intruder detected on Living Room"
+User -> Server : GET /snapshots/<file>.jpg
+Server --> User : annotated JPEG
+User -> User : Render in event log
+
+@enduml

@@ -262,8 +262,7 @@ class CaptureWorker(threading.Thread):
 
 class CameraManager:
     def __init__(self, *, db_path: str, models: Models, settings,
-                 bus: EventBus, person_store, intruder_store, zone_store,
-                 reid_store=None):
+                 bus: EventBus, person_store, intruder_store, zone_store):
         self.db_path = db_path
         self.models = models
         self.settings = settings
@@ -271,7 +270,6 @@ class CameraManager:
         self.person_store = person_store
         self.intruder_store = intruder_store
         self.zone_store = zone_store
-        self.reid_store = reid_store
         self.store = CameraStore(db_path)
 
         self._workers: dict[int, CaptureWorker] = {}
@@ -408,7 +406,6 @@ class CameraManager:
             zone_store=self.zone_store,
             intruder_store=self.intruder_store,
             bus=self.bus,
-            reid_store=self.reid_store,
         )
         latest = LatestFrame()
         latest.set(disconnected_placeholder(text=f"{cam['name']}: starting..."))

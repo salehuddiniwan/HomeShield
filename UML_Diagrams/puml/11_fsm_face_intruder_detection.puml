@@ -1,0 +1,140 @@
+@startuml HomeShield FSM - Face / Intruder Detection
+title HomeShield - Finite-State Machine (FSM) for Face and Intruder Detection\nArcFace embedding + cosine match; thresholds from homeshield/face.py + settings.py
+
+skinparam state {
+    BackgroundColor #FFFBEB
+    BorderColor     #92400E
+    BackgroundColor<<idle>>    #DCFCE7
+    BorderColor<<idle>>        #166534
+    BackgroundColor<<inspect>> #DBEAFE
+    BorderColor<<inspect>>     #1E40AF
+    BackgroundColor<<known>>   #BBF7D0
+    BorderColor<<known>>       #166534
+    BackgroundColor<<alert>>   #FECACA
+    BorderColor<<alert>>       #991B1B
+    BackgroundColor<<cool>>    #FEF3C7
+    BorderColor<<cool>>        #92400E
+    FontName Inter
+}
+
+skinparam ArrowColor #1E40AF
+
+[*] --> DISABLED
+
+state "DISABLED" as DISABLED <<idle>> {
+    DISABLED : face_enabled = False
+    DISABLED : InsightFace engine unloaded.
+    DISABLED : (recommended on CPU-only)
+}
+
+state "IDLE" as IDLE <<idle>> {
+    IDLE : face_enabled = True
+    IDLE : Waiting for next slot
+    IDLE : frame_idx % face_every_n != 0
+}
+
+state "DETECTING" as DET <<inspect>> {
+    DET : FaceWorker.submit(frame)
+    DET : (non-blocking; runs on
+    DET : a separate daemon thread)
+    DET : InsightFace .get(frame) ->
+    DET : list of {bbox, embedding}
+}
+
+state "MATCHING" as MATCH <<inspect>> {
+    MATCH : best_match(query, gallery)
+    MATCH : cosine similarity vs
+    MATCH : PersonStore embeddings
+    MATCH : threshold = 0.42\n(face_match_threshold)
+}
+
+state "KNOWN_FACE" as KNOWN <<known>> {
+    KNOWN : Match score >= 0.42
+    KNOWN : person_category =\nadult / child / elderly
+    KNOWN : NO alert raised
+    KNOWN : Label drawn on overlay
+}
+
+state "INTRUDER_PENDING" as PENDING <<inspect>> {
+    PENDING : Match score < 0.42
+    PENDING : (no entry in gallery)
+}
+
+state "INTRUDER_ALERT" as ALERT <<alert>> {
+    ALERT : entry / emit Event(intruder_detected)
+    ALERT : IntruderStore.add(\n  embedding, snapshot,\n  camera_id, camera_name)
+    ALERT : SSE pushed to dashboard
+}
+
+state "COOLDOWN (per camera)" as COOL <<cool>> {
+    COOL : Same camera will NOT raise
+    COOL : another intruder alert for
+    COOL : intruder_cooldown = 30 seconds
+    COOL : (avoids spam from continuous
+    COOL : presence of the same stranger)
+}
+
+' ====== Transitions ======
+
+DISABLED --> IDLE          : user toggles face_enabled = True\n(hot reload)
+IDLE     --> DISABLED      : user toggles face_enabled = False
+
+IDLE     --> DET           : frame_idx % face_every_n == 0\n(face_every_n = 5)
+DET      --> IDLE          : no face in frame\n(empty list)
+
+DET      --> MATCH         : at least one face\nwith embedding
+
+MATCH    --> KNOWN         : best score >= 0.42
+MATCH    --> PENDING       : best score < 0.42
+KNOWN    --> IDLE          : annotate frame and return
+
+PENDING  --> ALERT         : camera cooldown elapsed
+PENDING  --> IDLE          : cooldown not elapsed\n(suppress, but still draw box)
+
+ALERT    --> COOL          : record _intruder_emitted[cam] = ts
+COOL     --> IDLE          : 30 seconds elapsed\nfor this camera
+
+note right of DET
+  Async by design:
+  FaceWorker runs InsightFace on
+  its OWN daemon thread, so the
+  slow ArcFace pass never stalls
+  the pose detector.
+  The main pipeline reads
+  latest_faces() and uses whatever
+  the worker has produced.
+end note
+
+note bottom of MATCH
+  Cosine similarity over 512-d
+  unit-normalised ArcFace vectors.
+  Implementation: best_match() in
+  homeshield/face.py:
+    sims = gallery @ unit(query)
+    idx  = argmax(sims)
+  Vectorised: one matrix-vector
+  multiply per face, fast even for
+  a gallery of 20+ family members.
+end note
+
+note left of DISABLED
+  Settings keys involved
+  (homeshield/settings.py):
+    face_enabled          = True
+    face_match_threshold  = 0.45
+      (default in settings; the
+       engine default 0.42 wins
+       when stricter)
+    face_every_n          = 5
+    intruder_cooldown     = 30
+end note
+
+note right of KNOWN
+  KNOWN_FACE is the "happy path".
+  The person_category attribute is
+  used downstream to decide whether
+  a person is treated as a "child"
+  for danger-zone alerts.
+end note
+
+@enduml

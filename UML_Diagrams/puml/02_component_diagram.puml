@@ -1,0 +1,96 @@
+@startuml HomeShield Component Diagram
+title HomeShield - Component Diagram
+
+skinparam componentStyle rectangle
+skinparam packageStyle rectangle
+skinparam component {
+    BackgroundColor<<frontend>>  #DBEAFE
+    BackgroundColor<<server>>    #FEF3C7
+    BackgroundColor<<core>>      #DCFCE7
+    BackgroundColor<<store>>     #FCE7F3
+    BackgroundColor<<model>>     #E9D5FF
+    BackgroundColor<<external>>  #F3F4F6
+}
+
+actor "User\n(browser)" as User
+
+package "HomeShield (single Flask process)" {
+
+    component "Web Dashboard\n(templates/index.html\n+ static/app.js, app.css)" as UI <<frontend>>
+
+    component "Flask App\nserver.py\n(REST + MJPEG + SSE)" as Server <<server>>
+    component "Auth Module\nauth.py\n(UserStore, decorators)" as Auth <<server>>
+
+    package "Detection Core" {
+        component "CameraManager\ncameras.py" as CamMgr <<core>>
+        component "CameraPipeline\npipeline.py" as Pipeline <<core>>
+        component "Models singleton\n(YOLO pose / fire,\nInsightFace)" as Models <<model>>
+        component "FaceWorker\n(async thread)" as FaceWk <<core>>
+        component "EventBus\nevents.py" as EvBus <<core>>
+        component "Annotator\nannotator.py" as Ann <<core>>
+        component "Fall FSM\nFall_Detection/\nfall_detection.py" as FallFSM <<core>>
+    }
+
+    package "Persistence" {
+        component "SettingsStore\nsettings.py" as Settings <<store>>
+        component "PersonStore\npersons.py" as PersonS <<store>>
+        component "IntruderStore\npersons.py" as IntruderS <<store>>
+        component "ZoneStore\nzones.py" as ZoneS <<store>>
+        database "SQLite DB\nhomeshield.db\n(WAL mode)" as SQLite <<store>>
+        folder "snapshots/\nperson_photos/\nintruder_photos/" as Snaps <<store>>
+    }
+}
+
+cloud "Camera Sources" as Cams <<external>> {
+    component "Webcam (0)"   as Wcam <<external>>
+    component "IP / RTSP\n(Tapo, etc.)" as RTSP <<external>>
+    component "Phone\n(DroidCam,\nIP Webcam)" as Phone <<external>>
+}
+
+' --- User <-> dashboard <-> server ---
+User --> UI : HTTPS (via\nCloudflare Tunnel)
+UI --> Server : fetch /api/*\nEventSource\n/events_stream
+
+Server --> Auth : require_login\nrequire_admin
+Server --> CamMgr
+Server --> Settings
+Server --> PersonS
+Server --> IntruderS
+Server --> ZoneS
+Server --> EvBus : publish system events
+
+' --- Camera management ---
+CamMgr --> Cams : OpenCV VideoCapture
+CamMgr --> Pipeline : 1 per camera
+Pipeline --> Models  : shared on GPU
+Pipeline --> FaceWk  : async submit
+FaceWk   --> Models  : InsightFace .get()
+Pipeline --> FallFSM : pose tracks
+Pipeline --> Ann     : draw overlays
+Pipeline --> ZoneS   : safe / danger lookup
+Pipeline --> EvBus   : Event(...)
+
+' --- Event bus -> storage + push ---
+EvBus --> SQLite : INSERT INTO events
+EvBus --> Snaps  : write annotated JPEG
+EvBus --> Server : SSE fan-out
+
+' --- Stores <-> DB ---
+Auth      --> SQLite
+Settings  --> SQLite
+PersonS   --> SQLite
+IntruderS --> SQLite
+ZoneS     --> SQLite
+
+' --- Stores <-> filesystem ---
+PersonS   --> Snaps
+IntruderS --> Snaps
+
+note right of Models
+  ONE set of weights, loaded once
+  on the GPU. Every CameraPipeline
+  uses the same instance, so adding
+  a camera does not duplicate VRAM.
+end note
+
+@enduml

@@ -1,0 +1,65 @@
+@startuml HomeShield Sequence Diagram - Fall
+title HomeShield - Sequence Diagram\n"Person falls -> Fall alert reaches browser"
+
+skinparam sequenceArrowColor #1E40AF
+skinparam sequenceLifeLineBorderColor #92400E
+skinparam sequenceParticipantBackgroundColor #FEF3C7
+
+actor "User\n(browser)" as User
+participant "Flask Server" as Server
+participant "CaptureWorker" as Worker
+participant "CameraPipeline" as Pipe
+participant "Models\n(YOLO pose)" as Pose
+participant "FallStateMachine\n(7-state FSM)" as FSM
+participant "ZoneStore" as Zones
+participant "EventBus" as Bus
+database "SQLite" as DB
+collections "SSE clients" as SSE
+
+User -> Server : open /dashboard
+Server --> User : HTML + JS
+User -> Server : EventSource /events_stream
+note over User, Server : Browser keeps SSE connection open
+
+loop every frame for camera 1
+    Worker -> Pipe : process_frame(frame)
+    Pipe -> Pose : track(frame)
+    Pose --> Pipe : keypoints + bboxes
+    Pipe -> FSM : step(result, H, W, ts)
+    FSM --> Pipe : persons[] with current state
+end
+
+== Critical moment: STANDING -> FALL_DETECTED ==
+
+Pipe -> FSM : step(result)
+FSM -> FSM : compute peak descent velocity\n(body-units per second)
+FSM -> FSM : compute trunk angle\n(shoulder->hip vector vs vertical)
+note right of FSM
+  Two-stage rule:
+    A) velocity > impact threshold
+    B) trunk_angle > 60 degrees
+       held for >= 0.5 s
+  Both must fire to leave STANDING.
+end note
+FSM --> Pipe : person.state = FALL_DETECTED
+
+Pipe -> Zones : is_in_safe_zone(cam=1, foot.x, foot.y)
+Zones --> Pipe : false (not on sofa/bed)
+
+Pipe -> Pipe : Cooldown OK? yes
+Pipe -> Pipe : Build Event(\n  type='fall_detected',\n  camera_id=1,\n  confidence=0.80,\n  bbox=...,\n  meta={person_id, fsm_state})
+
+Pipe -> Bus : publish(event, frame)
+Bus -> Bus : daemon worker wakes
+Bus -> Bus : draw 'FALL' badge on snapshot
+Bus -> DB : INSERT INTO events
+DB --> Bus : event_id = 73
+Bus -> SSE : SSE 'event' payload
+SSE --> User : data: {event_id:73, type:'fall_detected', ...}
+
+User -> User : Toast "Fall detected on Living Room"
+User -> Server : GET /snapshots/...fall_detected.jpg
+Server --> User : annotated JPEG
+User -> User : Append entry to live event log
+
+@enduml

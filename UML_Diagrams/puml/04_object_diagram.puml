@@ -1,0 +1,130 @@
+@startuml HomeShield Object Diagram
+title HomeShield - Object Diagram (runtime snapshot, 2 cameras)
+
+skinparam object {
+    BackgroundColor #FFFBEB
+    BorderColor #92400E
+    BackgroundColor<<store>>  #FCE7F3
+    BackgroundColor<<core>>   #DCFCE7
+    BackgroundColor<<model>>  #E9D5FF
+    BackgroundColor<<event>>  #FECACA
+}
+
+object "models : Models" as models <<model>> {
+    pose_model = YOLO('yolo11n-pose.pt')
+    fire_model = YOLO('best.pt')
+    face_engine = FaceEngine(buffalo_l, GPU)
+    device = '0'
+}
+
+object "settings : SettingsStore" as settings <<store>> {
+    fall_enabled  = True
+    fire_enabled  = True
+    face_enabled  = True
+    fire_every_n  = 2
+    face_every_n  = 5
+    alert_cooldown = 60
+}
+
+object "zones : ZoneStore" as zones <<store>> {
+    _by_camera = {
+      1: [Z_safe_sofa, Z_danger_kitchen],
+      2: [Z_safe_bed]
+    }
+}
+
+object "personStore : PersonStore" as people <<store>> {
+    gallery_size = 3
+    members = [Ahmad, Aisyah, GrandmaSiti]
+}
+
+object "intruderStore : IntruderStore" as intruders <<store>> {
+    open_intruders = 1
+}
+
+object "manager : CameraManager" as mgr <<core>> {
+    workers = {1: worker1, 2: worker2}
+}
+
+object "worker1 : CaptureWorker" as w1 <<core>> {
+    camera_id = 1
+    camera_name = 'Living Room'
+    url = 'rtsp://192.168.1.10:554/stream2'
+    connected = true
+    fps = 28.4
+}
+object "pipeline1 : CameraPipeline" as p1 <<core>> {
+    _frame_idx = 8421
+    _smoothed_fps = 28.4
+}
+object "latest1 : LatestFrame" as l1 <<core>> {
+    _version = 8421
+    jpeg_bytes = 142_310
+}
+
+object "worker2 : CaptureWorker" as w2 <<core>> {
+    camera_id = 2
+    camera_name = 'Bedroom'
+    url = 'http://192.168.1.22:8080/video'
+    connected = true
+    fps = 27.9
+}
+object "pipeline2 : CameraPipeline" as p2 <<core>> {
+    _frame_idx = 7991
+    _smoothed_fps = 27.9
+}
+object "latest2 : LatestFrame" as l2 <<core>> {
+    _version = 7991
+    jpeg_bytes = 138_002
+}
+
+object "bus : EventBus" as bus <<core>> {
+    queue_size = 0
+    subscribers = 2
+}
+
+object "evt42 : Event" as evt <<event>> {
+    event_type = 'fall_detected'
+    ts = 1779030212.5
+    camera_id = 1
+    camera_name = 'Living Room'
+    person_category = 'elderly'
+    confidence = 0.80
+    snapshot_path = 'snapshots/...jpg'
+}
+
+' --- Relations ---
+mgr -- w1
+mgr -- w2
+w1  -- p1
+w1  -- l1
+w2  -- p2
+w2  -- l2
+
+p1 --> models  : shared
+p2 --> models  : shared
+p1 --> settings
+p2 --> settings
+p1 --> zones
+p2 --> zones
+
+p1 ..> evt : just emitted
+evt --> bus
+bus --> intruders : not this one
+people <.. p1     : best_match()
+
+note right of models
+  ONE instance shared across BOTH pipelines.
+  Adding worker2 did NOT duplicate the YOLO
+  weights in GPU memory.
+end note
+
+note bottom of evt
+  Snapshot of a live fall event from
+  camera 1 in the Living Room. The
+  EventBus is about to write it to
+  homeshield.db and push it to all SSE
+  subscribers.
+end note
+
+@enduml

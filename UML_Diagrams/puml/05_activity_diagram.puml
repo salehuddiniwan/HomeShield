@@ -1,0 +1,104 @@
+@startuml HomeShield Activity Diagram
+title HomeShield - Activity Diagram (per-frame processing for one camera)
+
+skinparam ActivityBackgroundColor #FEF9C3
+skinparam ActivityBorderColor #92400E
+skinparam ArrowColor #1E40AF
+skinparam ActivityDiamondBackgroundColor #FECACA
+
+start
+
+:Read frame from camera\n(OpenCV VideoCapture);
+
+if (Frame is empty?) then (yes)
+    :Show 'Disconnected' placeholder;
+    :Sleep and retry connection;
+    stop
+else (no)
+endif
+
+:Increment frame_idx\n(update FPS estimate);
+
+partition "Pose detection (EVERY frame)" {
+    :YOLO pose.track(frame);
+    :Fall FSM.step()\n-> classify each person\n   into 1 of 7 states;
+}
+
+partition "Fire detection (every fire_every_n frames)" {
+    if (fire_enabled and\nframe_idx % n == 0?) then (yes)
+        :YOLO fire_model.predict(frame);
+        :For each detected class,\nupdate per-class cache;
+    else (no)
+        :Re-use cached fire result;
+    endif
+}
+
+partition "Face detection (every face_every_n frames, async)" {
+    if (face_enabled and\nframe_idx % m == 0?) then (yes)
+        :FaceWorker.submit(frame)\n(non-blocking);
+    else (no)
+    endif
+    :Read latest face results\nfrom FaceWorker buffer;
+}
+
+:Look up Safe and Danger\nzones for this camera\n(ZoneStore);
+
+partition "Event emission" {
+    while (each tracked person) is (next)
+        if (FSM state changed to\nFALL_DETECTED or\nLYING_MOTIONLESS or\nINACTIVITY?) then (yes)
+            if (Inside a Safe zone?) then (yes)
+                :Suppress alert;
+            else (no)
+                if (Cooldown elapsed?) then (yes)
+                    :Build Event(fall_detected ...);
+                    :events.append(event);
+                else (no)
+                    :Skip (still in cooldown);
+                endif
+            endif
+        else (no)
+        endif
+
+        if (Child entered a Danger zone?) then (yes)
+            :Build Event(zone_entry ...);
+            :events.append(event);
+        else (no)
+        endif
+    endwhile (done)
+
+    if (Fire detected this frame?) then (yes)
+        if (Cooldown elapsed?) then (yes)
+            :Build Event(fire_detected ...);
+            :events.append(event);
+        else (no)
+        endif
+    else (no)
+    endif
+
+    if (Unknown face seen?) then (yes)
+        if (Cooldown elapsed?) then (yes)
+            :Build Event(intruder_detected ...);
+            :IntruderStore.add(embedding,\nsnapshot, camera);
+            :events.append(event);
+        else (no)
+        endif
+    else (no)
+    endif
+}
+
+:Annotator.annotate(frame, result)\n-> draw boxes, skeletons, labels;
+
+:LatestFrame.set(annotated_frame)\n(updates MJPEG buffer);
+
+:For each event in result.events\nEventBus.publish(event, frame);
+
+note right
+  publish() is non-blocking.
+  A daemon thread does:
+    - JPEG encode snapshot
+    - INSERT INTO events
+    - SSE broadcast to subscribers
+end note
+
+stop
+@enduml

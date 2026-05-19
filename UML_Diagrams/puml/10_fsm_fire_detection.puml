@@ -1,0 +1,109 @@
+@startuml HomeShield FSM - Fire Detection
+title HomeShield - Finite-State Machine (FSM) for Fire and Smoke Detection\nPer-class cooldown; thresholds from homeshield/settings.py + pipeline.py
+
+skinparam state {
+    BackgroundColor #FFFBEB
+    BorderColor     #92400E
+    BackgroundColor<<idle>>    #DCFCE7
+    BorderColor<<idle>>        #166534
+    BackgroundColor<<inspect>> #DBEAFE
+    BorderColor<<inspect>>     #1E40AF
+    BackgroundColor<<alert>>   #FECACA
+    BorderColor<<alert>>       #991B1B
+    BackgroundColor<<cool>>    #FEF3C7
+    BorderColor<<cool>>        #92400E
+    FontName Inter
+}
+
+skinparam ArrowColor #1E40AF
+
+[*] --> DISABLED
+
+state "DISABLED" as DISABLED <<idle>> {
+    DISABLED : fire_enabled = False
+    DISABLED : Model unloaded from GPU
+    DISABLED : (Models._sync_optional drops fire_model)
+}
+
+state "IDLE" as IDLE <<idle>> {
+    IDLE : fire_enabled = True
+    IDLE : Waiting for next inference slot.
+    IDLE : frame_idx % fire_every_n != 0
+}
+
+state "INFERRING" as INFER <<inspect>> {
+    INFER : Run YOLO fire_model.predict()
+    INFER : conf >= 0.35
+    INFER : imgsz = 640
+    INFER : --
+    INFER : Cache result per class
+    INFER : (last detection re-used\nuntil the next inference slot)
+}
+
+state "FIRE_PENDING" as PENDING <<inspect>> {
+    PENDING : At least one detection with
+    PENDING : cls in {fire, smoke}
+    PENDING : best confidence >= 0.35
+}
+
+state "FIRE_ALERT (per class)" as ALERT <<alert>> {
+    ALERT : entry / emit Event(fire_detected)
+    ALERT : meta.class = "fire" OR "smoke"
+    ALERT : confidence = per-class best
+    ALERT : snapshot saved to snapshots/
+    ALERT : SSE pushed to dashboard
+}
+
+state "COOLDOWN (per class)" as COOL <<cool>> {
+    COOL : Same class will NOT alert again
+    COOL : for fire_cooldown = 5 seconds
+    COOL : per cls in fire_classes
+    COOL : (debounces flicker / repeat detections)
+}
+
+' ====== Transitions ======
+
+DISABLED --> IDLE          : user toggles fire_enabled = True\n(hot reload, no restart)
+IDLE     --> DISABLED      : user toggles fire_enabled = False
+
+IDLE     --> INFER         : frame_idx % fire_every_n == 0\n(fire_every_n = 2)
+INFER    --> IDLE          : no fire/smoke detection\n(boxes empty)
+
+INFER    --> PENDING       : at least one detection\nin fire_classes
+
+PENDING  --> ALERT         : per-class cooldown elapsed\nts - _fire_emitted[cls] >= 5 s
+PENDING  --> IDLE          : cooldown NOT elapsed\n(suppress, re-use cached boxes)
+
+ALERT    --> COOL          : after emitting event\n(record _fire_emitted[cls] = ts)
+COOL     --> IDLE          : 5 seconds elapsed\nfor this class
+
+note right of INFER
+  Frame-skipping reduces GPU load:
+  fire detector runs every 2nd frame
+  while pose runs every frame.
+  Between inferences, the cached
+  result is reused for annotation.
+end note
+
+note bottom of ALERT
+  The "fire" and "smoke" classes
+  have INDEPENDENT cooldowns.
+  Example: "fire" alert at t=0
+  blocks new fire alerts until t=5,
+  but a "smoke" alert at t=1 is
+  still allowed and starts its
+  own 5-second cooldown.
+end note
+
+note left of DISABLED
+  Settings keys involved
+  (homeshield/settings.py):
+    fire_enabled      = True
+    fire_model        = "best.pt"
+    fire_confidence   = 0.35
+    fire_cooldown     = 5
+    fire_classes      = "fire,smoke"
+    fire_every_n      = 2
+end note
+
+@enduml

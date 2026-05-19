@@ -53,6 +53,9 @@ runs/
 *.log
 logs/
 
+# ---- Word documents (reports, drafts) ----
+*.docx
+
 # ---- Large model weights (re-download manually; see README) ----
 # yolo26x-pose.pt is 121 MB which exceeds GitHub's 100 MB hard limit per file.
 # Download it from Ultralytics (https://github.com/ultralytics/assets/releases)

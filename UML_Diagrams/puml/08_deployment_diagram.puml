@@ -1,0 +1,69 @@
+@startuml HomeShield Deployment Diagram
+title HomeShield - Deployment Diagram\n(home LAN + optional Cloudflare Tunnel)
+
+skinparam node {
+    BackgroundColor #DBEAFE
+    BorderColor #1E40AF
+}
+skinparam database {
+    BackgroundColor #FCE7F3
+}
+skinparam cloud {
+    BackgroundColor #F3F4F6
+}
+
+node "Windows 11 Workstation\n(NVIDIA GPU, CUDA 12.x)" as PC {
+    artifact "Python 3.11\nvenv: homeshield" as Py
+    artifact "run_homeshield.py" as Run
+    component "Flask App\n(0.0.0.0:5000)" as Flask
+    database "homeshield.db\n(SQLite, WAL)" as DB
+    folder "snapshots/\nperson_photos/\nintruder_photos/" as Files
+    artifact "cloudflared.exe\n(Windows service)" as CFD
+}
+
+node "Home Wi-Fi" as LAN {
+    node "Phone\n(family use)"   as Phone
+    node "Laptop"                as Lap
+    node "TP-Link Tapo C200/C210" as Tapo
+    node "Webcam"                as Wcam
+    node "Old Android\n(DroidCam / IP Webcam)" as Droid
+}
+
+cloud "Cloudflare Network" as CF {
+    component "Cloudflare\nEdge POP\n(nearest data center)" as Edge
+    component "Quick Tunnel URL\n*.trycloudflare.com\nor named tunnel" as URL
+}
+
+actor "Remote user\n(supervisor / family)" as Remote
+
+' --- Local network connections ---
+Tapo  --> Flask : RTSP\nrtsp://user:pwd@ip:554/stream2
+Wcam  --> Flask : USB (device index 0)
+Droid --> Flask : HTTP\nhttp://phone:4747/video
+Phone --> Flask : HTTP\nLAN dashboard
+Lap   --> Flask : HTTP\nLAN dashboard
+
+Flask --> DB    : sqlite3 (WAL)
+Flask --> Files : os.write
+
+' --- Optional Cloudflare Tunnel path ---
+CFD ..> Flask  : outbound to localhost:5000
+CFD --> Edge   : encrypted outbound\n(QUIC / HTTP/2)
+Edge --> URL   : exposes
+URL --> Remote : HTTPS
+
+note right of CFD
+  Outbound only.
+  No router port forwarding,
+  no public IP, no open ports
+  on the home router.
+end note
+
+note bottom of CF
+  Cloudflare terminates TLS and
+  forwards the request through the
+  tunnel into the local Flask app.
+  Free plan, automatic HTTPS.
+end note
+
+@enduml

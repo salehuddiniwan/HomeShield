@@ -1,0 +1,131 @@
+@startuml HomeShield FSM - Fall Detection
+title HomeShield - Finite-State Machine (FSM) for Fall Detection\n7 states; thresholds from Fall_Detection/fall_detection.py
+
+skinparam state {
+    BackgroundColor #FFFBEB
+    BorderColor     #92400E
+    BackgroundColor<<safe>>   #DCFCE7
+    BorderColor<<safe>>       #166534
+    BackgroundColor<<alert>>  #FECACA
+    BorderColor<<alert>>      #991B1B
+    BackgroundColor<<warn>>   #FEF3C7
+    BorderColor<<warn>>       #92400E
+    FontName Inter
+}
+
+skinparam ArrowColor #1E40AF
+
+[*] --> STANDING
+
+state "q0 STANDING" as STANDING <<safe>> {
+    STANDING : Upright posture.
+    STANDING : trunk_angle < 30°
+    STANDING : aspect_ratio < 0.7
+    STANDING : motion < 0.05 body-units/s
+}
+
+state "q1 WALKING" as WALKING <<safe>> {
+    WALKING : Upright AND moving.
+    WALKING : trunk_angle < 30°
+    WALKING : motion >= 0.05 body-units/s
+}
+
+state "q2 SITTING" as SITTING <<safe>> {
+    SITTING : Folded posture, NOT lying.
+    SITTING : aspect_ratio between 0.7 and 1.3
+    SITTING : trunk_angle moderate
+}
+
+state "q3 FALL_DETECTED" as FALL <<alert>> {
+    FALL : Active fall confirmed.
+    FALL : Stage A: peak descent velocity\n> 1.6 body-units/s
+    FALL : Stage B: trunk_angle > 60°\nheld >= 0.5 s
+    FALL : --
+    FALL : entry / emit Event(fall_detected)
+}
+
+state "q4 LYING_AFTER_FALL" as LYING_AFTER <<warn>> {
+    LYING_AFTER : Horizontal but still moving.
+    LYING_AFTER : trunk_angle > 60°
+    LYING_AFTER : motion >= 0.10 body-units/s
+}
+
+state "q5 LYING_MOTIONLESS" as MOTIONLESS <<alert>> {
+    MOTIONLESS : Horizontal AND not moving for >= 5 s.
+    MOTIONLESS : trunk_angle > 60°
+    MOTIONLESS : motion < 0.10 body-units/s
+    MOTIONLESS : --
+    MOTIONLESS : entry / emit Event(lying_motionless)
+}
+
+state "q6 INACTIVITY" as INACTIVITY <<warn>> {
+    INACTIVITY : Upright but no motion for >= 5 s.
+    INACTIVITY : trunk_angle < 30°
+    INACTIVITY : motion < 0.10 body-units/s
+    INACTIVITY : --
+    INACTIVITY : entry / emit Event(inactivity)
+}
+
+' ====== Transitions ======
+
+' Normal locomotion
+STANDING --> WALKING        : motion >= 0.05 bu/s
+WALKING  --> STANDING       : motion < 0.05 bu/s\nfor short window
+STANDING --> SITTING        : aspect_ratio in [0.7, 1.3]\nAND height drop within limits\n(controlled sit, NOT a fall)
+SITTING  --> STANDING       : upright posture restored
+WALKING  --> SITTING        : aspect_ratio in [0.7, 1.3]
+
+' --- Fall trigger (rising edge from any upright/sitting state) ---
+STANDING --> FALL  : Stage A AND Stage B
+WALKING  --> FALL  : Stage A AND Stage B
+SITTING  --> FALL  : Stage A AND Stage B\n(rejected when only Stage A;\nthis is what stops false alerts\non a sudden sit-down)
+
+' --- After-fall path ---
+FALL          --> LYING_AFTER  : person stays horizontal\nbut still moving
+FALL          --> MOTIONLESS   : person horizontal AND still\nfor >= 5 s
+FALL          --> STANDING     : person stands back up\nwithin recovery window
+
+LYING_AFTER   --> MOTIONLESS   : no motion for >= 5 s
+LYING_AFTER   --> STANDING     : person gets up
+
+MOTIONLESS    --> STANDING     : person gets up
+
+' --- Inactivity branch ---
+STANDING   --> INACTIVITY  : motion < 0.10 bu/s for >= 5 s
+INACTIVITY --> STANDING    : motion resumes
+INACTIVITY --> FALL        : Stage A AND Stage B occur\nfrom inactivity
+
+' Suppression rules (annotation only)
+note bottom of FALL
+  All fall_detected events are
+  suppressed when the foot point
+  falls inside a SAFE zone
+  (e.g. on a bed or sofa).
+  -- ZoneStore.is_in_safe_zone()
+end note
+
+note right of MOTIONLESS
+  Same suppression: alerts are
+  cancelled inside a safe zone.
+  Outside a safe zone, the event
+  is published with cooldown
+  alert_cooldown = 60 s
+  to avoid spamming the dashboard.
+end note
+
+note left of STANDING
+  Initial state.
+  --
+  Thresholds defined in Config()
+  in Fall_Detection/fall_detection.py:
+    impact_velocity_bu_s   = 1.6
+    sustain_s              = 0.5
+    horizontal_angle_min   = 60.0
+    upright_angle_max      = 30.0
+    walking_motion_min     = 0.05
+    motion_threshold_bu_s  = 0.10
+    lying_motionless_s     = 5.0
+    inactivity_s           = 5.0
+end note
+
+@enduml
