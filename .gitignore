@@ -70,3 +70,17 @@ Fall_Detection/weights/yolo26x-pose.pt
 
 # ---- Claude / agent caches ----
 .claude/
+
+# ---- Non-project / scratch artefacts (not part of HomeShield) ----
+.understand/
+.understand-anything/
+*.und
+scratch/
+tmp/
+temp/
+notes/
+draft/
+drafts/
+*.bak
+*.tmp
+*.orig

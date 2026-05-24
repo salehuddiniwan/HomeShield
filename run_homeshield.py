@@ -17,6 +17,7 @@ python run_homeshield.py --host 127.0.0.1
 from __future__ import annotations
 
 import argparse
+import socket
 import sys
 from pathlib import Path
 
@@ -25,6 +26,22 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from homeshield.server import create_app
+
+
+def lan_ip() -> "str | None":
+    """Best-effort detection of this machine's LAN IP address.
+
+    Opens a UDP socket toward a public address (no packets are actually
+    sent) so the OS picks the interface used for outbound traffic.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return None
+    finally:
+        s.close()
 
 
 def main():
@@ -48,7 +65,21 @@ def main():
         auto_start=not args.no_autostart,
     )
 
-    print(f"\n[HomeShield] Dashboard: http://{args.host}:{args.port}/")
+    print(f"\n[HomeShield] This computer : http://localhost:{args.port}/")
+    if args.host in ("0.0.0.0", "::"):
+        ip = lan_ip()
+        if ip:
+            print(f"[HomeShield] Other devices : http://{ip}:{args.port}/")
+            print("[HomeShield]   ^ open THIS url on your phone/laptop "
+                  "(NOT 0.0.0.0).")
+        else:
+            print("[HomeShield] Other devices : could not detect LAN IP; "
+                  "run `ipconfig` and use this PC's IPv4 address.")
+        print("[HomeShield]   If it still won't load, allow Python through "
+              "the Windows Firewall (see notes).")
+    else:
+        print(f"[HomeShield] Bound to {args.host} only "
+              "(other devices cannot reach it).")
     print(f"[HomeShield] Database : {Path(args.db).resolve()}")
     print(f"[HomeShield] Snapshots: {Path(args.snapshots).resolve()}\n")
 

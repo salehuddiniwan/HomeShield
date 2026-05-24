@@ -1,0 +1,141 @@
+@startuml HomeShield ERD
+title HomeShield - Entity-Relationship Diagram (homeshield.db)
+
+' Use PlantUML class notation as ERD entities (PK underlined; FK marked)
+skinparam classBackgroundColor #FFFBEB
+skinparam classBorderColor #92400E
+skinparam classFontStyle bold
+skinparam ArrowColor #1E40AF
+skinparam linetype ortho
+
+skinparam class {
+    BackgroundColor<<core>>     #DCFCE7
+    BackgroundColor<<event>>    #FEF3C7
+    BackgroundColor<<zone>>     #DBEAFE
+    BackgroundColor<<person>>   #E9D5FF
+    BackgroundColor<<intruder>> #FCE7F3
+    BackgroundColor<<settings>> #F3F4F6
+    BackgroundColor<<user>>     #FEE2E2
+}
+
+' ================= cameras =================
+entity "cameras" as cameras <<core>> {
+    <u>camera_id : INTEGER PK</u>
+    --
+    name        : TEXT NOT NULL
+    url         : TEXT NOT NULL
+    location    : TEXT DEFAULT ''
+    enabled     : INTEGER DEFAULT 1
+    created_at  : TEXT DEFAULT datetime('now')
+}
+
+' ================= events =================
+entity "events" as events <<event>> {
+    <u>event_id : INTEGER PK</u>
+    --
+    ts              : REAL NOT NULL
+    created_at      : TEXT NOT NULL
+    event_type      : TEXT NOT NULL
+    *camera_id      : INTEGER  <<FK -> cameras>>
+    camera_name     : TEXT
+    person_category : TEXT DEFAULT 'unknown'
+    confidence      : REAL DEFAULT 0
+    details         : TEXT
+    snapshot_path   : TEXT
+    bbox_json       : TEXT
+    meta_json       : TEXT
+    --
+    idx_events_ts (ts DESC)
+    idx_events_type (event_type)
+    idx_events_cam (camera_id)
+}
+
+' ================= zones =================
+entity "zones" as zones <<zone>> {
+    <u>zone_id : INTEGER PK</u>
+    --
+    zone_name    : TEXT NOT NULL
+    *camera_id   : INTEGER NOT NULL  <<FK -> cameras>>
+    polygon_json : TEXT NOT NULL
+    zone_type    : TEXT DEFAULT 'danger'
+    created_at   : TEXT DEFAULT datetime('now')
+    --
+    idx_zones_cam (camera_id)
+}
+
+' ================= persons =================
+entity "persons" as persons <<person>> {
+    <u>person_id : INTEGER PK</u>
+    --
+    name           : TEXT NOT NULL
+    category       : TEXT DEFAULT 'adult'
+    photo_path     : TEXT
+    embedding_blob : BLOB
+    created_at     : TEXT DEFAULT datetime('now')
+    --
+    idx_persons_name (name)
+}
+
+' ================= intruders =================
+entity "intruders" as intruders <<intruder>> {
+    <u>intruder_id : INTEGER PK</u>
+    --
+    photo_path     : TEXT
+    embedding_blob : BLOB
+    *camera_id     : INTEGER  <<FK -> cameras>>
+    camera_name    : TEXT
+    detected_at    : TEXT DEFAULT datetime('now')
+    dismissed      : INTEGER DEFAULT 0
+    --
+    idx_intruders_at (detected_at DESC)
+}
+
+' ================= settings =================
+entity "settings" as settings <<settings>> {
+    <u>key : TEXT PK</u>
+    --
+    value      : TEXT
+    updated_at : TEXT DEFAULT datetime('now')
+}
+
+' ================= users =================
+entity "users" as users <<user>> {
+    <u>user_id : INTEGER PK</u>
+    --
+    username      : TEXT NOT NULL UNIQUE
+    password_hash : TEXT NOT NULL
+    role          : TEXT DEFAULT 'guest'
+    must_change   : INTEGER DEFAULT 0
+    created_at    : TEXT DEFAULT datetime('now')
+    --
+    idx_users_username (username)
+}
+
+' ================= Relationships =================
+' One-to-many from cameras to events, zones, intruders
+cameras "1" --> "0..*" events    : produces
+cameras "1" --> "0..*" zones     : has
+cameras "1" --> "0..*" intruders : captures
+
+' persons and intruders both carry a face embedding_blob (no FK; matched at runtime by cosine similarity).
+persons   ..> intruders : "shares 512-d\nembedding_blob\n(matched at\nruntime, not FK)"
+
+' settings and users are standalone lookup tables (no FK relationships).
+note bottom of settings
+  Key-value store for hot-reloadable
+  runtime settings (no FK).
+end note
+
+note bottom of users
+  Auth table. Used by login session
+  and role-based access (no FK).
+end note
+
+' ================= Footnote =================
+legend bottom
+  Database: SQLite (homeshield.db)
+  PRAGMA journal_mode = WAL  |  PRAGMA foreign_keys = ON
+  PK underlined; * = foreign key column; BLOB = 512-d ArcFace embedding.
+endlegend
+
+@enduml

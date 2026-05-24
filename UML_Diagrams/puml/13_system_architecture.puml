@@ -1,0 +1,82 @@
+@startuml HomeShield System Architecture
+title HomeShield - Simple System Architecture
+
+skinparam componentStyle rectangle
+skinparam packageStyle rectangle
+skinparam ArrowColor #1E40AF
+skinparam shadowing false
+
+skinparam component {
+    BackgroundColor<<camera>>   #DBEAFE
+    BackgroundColor<<process>>  #DCFCE7
+    BackgroundColor<<server>>   #FEF3C7
+    BackgroundColor<<store>>    #FCE7F3
+    BackgroundColor<<ui>>       #E9D5FF
+}
+skinparam database {
+    BackgroundColor #FCE7F3
+    BorderColor #92400E
+}
+
+' ================= Camera Sources =================
+package "Camera Sources" as Cams {
+    component "IP / RTSP Cameras\n(Tapo, Hikvision, etc.)" as IP <<camera>>
+    component "Webcams\n(USB / built-in)"                  as WC <<camera>>
+    component "Phone Cameras\n(DroidCam, IP Webcam)"       as PH <<camera>>
+}
+
+' ============ Local Processing Unit ===============
+package "Local Processing Unit (User's Own Computer)" as LPU {
+
+    package "Detection Pipeline (shared GPU / CPU)" as Pipe {
+        component "YOLO Pose\n(Fall + person location)" as Pose   <<process>>
+        component "YOLO Fire Model\n(custom best.pt)"    as Fire   <<process>>
+        component "InsightFace ArcFace\n(512-d face embeddings)" as Face <<process>>
+        component "Zone Check\n(point-in-polygon)"       as Zone   <<process>>
+    }
+
+    component "Flask Server\nserver.py\n(REST + MJPEG + SSE)" as Flask <<server>>
+
+    database "SQLite Database\nhomeshield.db\n(WAL mode)" as DB <<store>>
+    folder   "snapshots/\nperson_photos/\nintruder_photos/" as Files <<store>>
+}
+
+' ================= Dashboard UI ===================
+node "Dashboard UI\n(Browser: PC / Tablet / Phone)" as UI <<ui>>
+actor "User" as User
+
+' ================= Data Flow ======================
+IP --> Pose : video frames
+WC --> Pose : video frames
+PH --> Pose : video frames
+
+Pose --> Fire   : raw frame (every n-th)
+Pose --> Face   : raw frame (every m-th)
+Pose --> Zone   : person foot position
+
+Pose --> Flask  : detection results
+Fire --> Flask  : fire / smoke result
+Face --> Flask  : known face / intruder
+Zone --> Flask  : zone violation
+
+Flask --> DB    : INSERT events
+Flask --> Files : write annotated snapshot
+DB --> Flask    : SELECT events / history
+
+Flask -- "HTTP + MJPEG + SSE\n(local Wi-Fi only)" --> UI
+User --> UI : views feeds,\nregisters faces,\ndraws zones
+
+note right of Pipe
+  One shared set of models is
+  loaded once on the GPU.
+  Adding a camera does NOT
+  duplicate GPU memory.
+end note
+
+note bottom of LPU
+  Privacy boundary: all video, snapshots and
+  face embeddings stay on the user's machine.
+  No data is sent to the cloud.
+end note
+
+@enduml
