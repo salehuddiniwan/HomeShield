@@ -76,6 +76,12 @@ class Models:
     def __init__(self, settings):
         self.settings = settings
         self._lock = threading.RLock()
+        # Serializes inference across per-camera worker threads. Ultralytics
+        # YOLO predict()/track() share mutable predictor state and are NOT
+        # thread-safe: concurrent calls from two cameras interleave, and one
+        # camera can come back with detections computed from the OTHER
+        # camera's frame (e.g. a fire on Camera 1 attributed to Camera 2).
+        self.infer_lock = threading.Lock()
         self.pose_model = None
         self.fire_model = None
         self.face_engine = None
@@ -270,7 +276,8 @@ class FaceWorker(threading.Thread):
                 continue
 
             try:
-                faces = engine.detect(frame)
+                with self.models.infer_lock:
+                    faces = engine.detect(frame)
             except Exception as e:
                 print(f"[face-worker cam={self.camera_id}] detect: {e}")
                 continue
@@ -440,12 +447,13 @@ class CameraPipeline:
         if self.models.pose_model is None:
             return
         try:
-            tr = self.models.pose_model.track(
-                frame,
-                imgsz=self.cfg.imgsz, conf=self.cfg.conf,
-                persist=True, tracker=self.cfg.tracker,
-                verbose=False, device=device,
-            )
+            with self.models.infer_lock:
+                tr = self.models.pose_model.track(
+                    frame,
+                    imgsz=self.cfg.imgsz, conf=self.cfg.conf,
+                    persist=True, tracker=self.cfg.tracker,
+                    verbose=False, device=device,
+                )
             if tr:
                 res.persons = self.fall_state.step(tr[0], H, W, ts)
         except Exception as e:
@@ -548,11 +556,12 @@ class CameraPipeline:
             res.fire_alert = self._cached_fire_alert
             return
         try:
-            fr = self.models.fire_model.predict(
-                frame,
-                conf=float(self.settings.get("fire_confidence", 0.35)),
-                imgsz=self.cfg.imgsz, device=device, verbose=False,
-            )
+            with self.models.infer_lock:
+                fr = self.models.fire_model.predict(
+                    frame,
+                    conf=float(self.settings.get("fire_confidence", 0.35)),
+                    imgsz=self.cfg.imgsz, device=device, verbose=False,
+                )
         except Exception as e:
             print(f"[pipeline.fire cam={self.camera_id}] {e}")
             return
