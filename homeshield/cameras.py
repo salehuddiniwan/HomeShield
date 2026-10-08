@@ -1,11 +1,13 @@
-"""Multi-camera lifecycle: CameraStore, LatestFrame, CaptureWorker, CameraManager."""
+"""Multi-camera lifecycle: CameraStore, LatestFrame, FrameGrabber,
+CaptureWorker, CameraManager."""
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
-import traceback
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 import cv2
@@ -15,6 +17,8 @@ from .annotator import annotate, disconnected_placeholder
 from .db import read_conn, write_conn
 from .events import Event, EventBus
 from .pipeline import CameraPipeline, Models
+
+log = logging.getLogger(__name__)
 
 
 # ---- CameraStore ----------------------------------------------------------
@@ -57,37 +61,124 @@ class CameraStore:
 # ---- LatestFrame ----------------------------------------------------------
 
 class LatestFrame:
-    """Thread-safe single-slot buffer (raw + JPEG-encoded copy)."""
+    """Thread-safe single slot: the annotated frame shown to viewers plus the
+    clean camera frame it was drawn from.
 
-    def __init__(self):
+    JPEG encoding is lazy: it happens once per new frame, only when a viewer
+    asks for it, on the viewer's thread. Previously every frame of every
+    camera was encoded on the capture thread even with nobody watching.
+
+    `raw()` returns the CLEAN frame. Face enrolment reads it, and running
+    ArcFace on the annotated frame (skeleton dots on the eyes and nose, a box
+    and label around the face) produced degraded enrolment embeddings.
+    """
+
+    def __init__(self, jpeg_quality: int = 80):
         self._cond = threading.Condition()
-        self._jpeg: Optional[bytes] = None
+        self._quality = int(jpeg_quality)
+        self._display: Optional[np.ndarray] = None
         self._raw: Optional[np.ndarray] = None
         self._version = 0
+        self._jpeg: Optional[bytes] = None
+        self._jpeg_version = -1
 
-    def set(self, frame: np.ndarray) -> None:
-        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-        if not ok:
-            return
+    def set(self, display: np.ndarray, raw: Optional[np.ndarray] = None) -> None:
+        """Publish a new frame. Takes ownership: callers must not modify either
+        array afterwards."""
         with self._cond:
-            self._jpeg = buf.tobytes()
-            self._raw = frame.copy()
+            self._display = display
+            self._raw = raw
             self._version += 1
             self._cond.notify_all()
+
+    def _encoded(self) -> tuple[Optional[bytes], int]:
+        with self._cond:
+            img, ver = self._display, self._version
+            if self._jpeg_version == ver:
+                return self._jpeg, ver
+        if img is None:
+            return None, ver
+        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), self._quality])
+        jpeg = buf.tobytes() if ok else None
+        with self._cond:
+            if ver > self._jpeg_version:
+                self._jpeg, self._jpeg_version = jpeg, ver
+        return jpeg, ver
 
     def get_blocking(self, last_version: int, timeout: float = 1.0):
         with self._cond:
             if self._version == last_version:
                 self._cond.wait(timeout=timeout)
-            return self._jpeg, self._version
+        return self._encoded()
 
     def jpeg(self) -> Optional[bytes]:
-        with self._cond:
-            return self._jpeg
+        return self._encoded()[0]
 
     def raw(self) -> Optional[np.ndarray]:
         with self._cond:
             return None if self._raw is None else self._raw.copy()
+
+
+# ---- FrameGrabber ---------------------------------------------------------
+
+class FrameGrabber(threading.Thread):
+    """Reads a live source continuously, keeping only the newest frame.
+
+    Network streams (RTSP / HTTP) buffer inside FFmpeg, where
+    CAP_PROP_BUFFERSIZE has no effect: when inference is slower than the
+    stream, a read-then-infer loop drifts further and further behind real
+    time and alerts arrive late. Reading on its own thread always hands the
+    pipeline the newest frame, stamps it with its capture time, and overlaps
+    camera I/O with inference.
+
+    The grabber owns the capture and releases it when it stops.
+    """
+
+    def __init__(self, cap: cv2.VideoCapture, *, name: str, max_fails: int):
+        super().__init__(daemon=True, name=name)
+        self._cap = cap
+        self._max_fails = max_fails
+        self._cond = threading.Condition()
+        self._frame: Optional[np.ndarray] = None
+        self._ts = 0.0
+        self._version = 0
+        self.done = False
+        self.read_fails = 0
+        self._stop_flag = threading.Event()   # not `_stop`: see CaptureWorker
+
+    def run(self) -> None:
+        try:
+            while not self._stop_flag.is_set():
+                ok, frame = self._cap.read()
+                if not ok or frame is None:
+                    self.read_fails += 1
+                    if self.read_fails >= self._max_fails:
+                        break
+                    self._stop_flag.wait(0.05)
+                    continue
+                self.read_fails = 0
+                with self._cond:
+                    self._frame, self._ts = frame, time.time()
+                    self._version += 1
+                    self._cond.notify_all()
+        finally:
+            with self._cond:
+                self.done = True
+                self._cond.notify_all()
+            self._cap.release()
+
+    def next(self, last_version: int, timeout: float = 1.0):
+        """Newest (frame, capture_ts, version) newer than `last_version`, or
+        None on timeout / once the grabber has stopped."""
+        with self._cond:
+            if self._version == last_version and not self.done:
+                self._cond.wait(timeout)
+            if self._version == last_version:
+                return None
+            return self._frame, self._ts, self._version
+
+    def stop(self) -> None:
+        self._stop_flag.set()
 
 
 # ---- CaptureWorker --------------------------------------------------------
@@ -109,13 +200,21 @@ def _parse_source(s):
     return s
 
 
+def _is_file_source(src) -> bool:
+    return isinstance(src, str) and Path(src).is_file()
+
+
+class _PipelineFailed(Exception):
+    """Too many consecutive pipeline errors: reconnect the camera."""
+
+
 class CaptureWorker(threading.Thread):
     """
     NOTE: do NOT name the stop flag ``self._stop`` -- it shadows
     ``threading.Thread._stop`` (called by Thread.join) and crashes.
     """
 
-    MAX_READ_FAILS = 30   # ~1 s @ 30 FPS, survive transient hiccups
+    MAX_READ_FAILS = 30   # ~1.5 s of failed reads, survive transient hiccups
     MAX_PIPE_ERRORS = 60  # consecutive pipeline errors -> reconnect
 
     def __init__(self, camera: dict, pipeline: CameraPipeline,
@@ -127,6 +226,8 @@ class CaptureWorker(threading.Thread):
         self.latest = latest
         self.status = WorkerStatus()
         self._stop_flag = threading.Event()
+        self._pipe_errors = 0
+        self._last_ts = 0.0
 
     def request_stop(self):
         self._stop_flag.set()
@@ -155,8 +256,8 @@ class CaptureWorker(threading.Thread):
     def run(self):
         self.status.started_at = time.time()
         backoff = 1.0
-        cid = self.camera["camera_id"]
         cname = self.camera["name"]
+        is_file = _is_file_source(_parse_source(self.camera["url"]))
 
         while not self._stop_flag.is_set():
             cap = self._open()
@@ -176,17 +277,17 @@ class CaptureWorker(threading.Thread):
             self.status.camera_connected = True
             self.status.last_error = None
             backoff = 1.0
+            self._pipe_errors = 0
 
             try:
-                self._loop(cap)
+                if is_file:
+                    self._loop_file(cap)
+                else:
+                    self._loop_live(cap)
             except Exception as e:
                 self.status.last_error = repr(e)
                 self._sys_event(f"Pipeline error: {e}", 0.0)
             finally:
-                try:
-                    cap.release()
-                except Exception:
-                    pass
                 self.status.camera_connected = False
 
     def _sys_event(self, msg: str, conf: float) -> None:
@@ -198,64 +299,98 @@ class CaptureWorker(threading.Thread):
             confidence=conf,
         ))
 
-    def _loop(self, cap: cv2.VideoCapture):
+    def _loop_live(self, cap: cv2.VideoCapture) -> None:
+        """Webcams and network streams: always process the newest frame."""
+        grabber = FrameGrabber(cap, name=f"hs-grab-{self.camera['camera_id']}",
+                               max_fails=self.MAX_READ_FAILS)
+        grabber.start()
+        version = 0
+        try:
+            while not self._stop_flag.is_set():
+                item = grabber.next(version, timeout=1.0)
+                if item is None:
+                    if grabber.done:
+                        return      # source failed: run() reconnects
+                    self.status.last_error = (
+                        f"No new frame ({grabber.read_fails}/{self.MAX_READ_FAILS} "
+                        "failed reads)")
+                    continue
+                frame, ts, version = item
+                loop_start = time.time()
+                self._handle(frame, ts)
+                self._throttle(loop_start)
+        finally:
+            grabber.stop()      # the grabber releases the capture itself
+
+    def _loop_file(self, cap: cv2.VideoCapture) -> None:
+        """Video files: every frame, timestamped by the file's own clock and
+        played no faster than real time, looping at the end.
+
+        Wall-clock timestamps would make a 30 FPS clip processed at 10 FPS look
+        3x slower to the fall FSM (every velocity 3x too small).
+        """
+        try:
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            fps = fps if 1.0 <= fps <= 240.0 else 30.0
+            base = max(time.time(), self._last_ts + 1.0 / fps)
+            idx = 0
+            while not self._stop_flag.is_set():
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    if idx == 0:
+                        return      # unreadable file: run() retries with backoff
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    base, idx = self._last_ts + 1.0 / fps, 0
+                    continue
+                ts = base + idx / fps
+                idx += 1
+                ahead = ts - time.time()
+                if ahead > 0 and self._stop_flag.wait(timeout=ahead):
+                    return
+                loop_start = time.time()
+                self._handle(frame, ts)
+                self._throttle(loop_start)
+        finally:
+            cap.release()
+
+    def _throttle(self, loop_start: float) -> None:
         """process_fps==0 -> unlimited; >0 -> soft cap."""
-        read_fails = 0
-        pipe_errors = 0
+        max_fps = int(self.pipeline.settings.get("process_fps", 0) or 0)
+        if max_fps > 0:
+            slack = (1.0 / max_fps) - (time.time() - loop_start)
+            if slack > 0:
+                self._stop_flag.wait(timeout=slack)
+
+    def _handle(self, frame: np.ndarray, ts: float) -> None:
         cid = self.camera["camera_id"]
+        self._last_ts = ts
+        try:
+            res = self.pipeline.process(frame, ts=ts)
+            self._pipe_errors = 0
+        except Exception as e:
+            self._pipe_errors += 1
+            self.status.last_error = repr(e)
+            if self._pipe_errors <= 3 or self._pipe_errors % 30 == 0:
+                log.exception("cam=%s frame error #%d: %s", cid, self._pipe_errors, e)
+            if self._pipe_errors >= self.MAX_PIPE_ERRORS:
+                raise _PipelineFailed(repr(e)) from e
+            self.latest.set(frame, frame)
+            return
 
-        while not self._stop_flag.is_set():
-            loop_start = time.time()
-
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                read_fails += 1
-                self.status.last_error = (
-                    f"Frame read failed ({read_fails}/{self.MAX_READ_FAILS})"
-                )
-                if read_fails >= self.MAX_READ_FAILS:
-                    break
-                if self._stop_flag.wait(timeout=0.05):
-                    break
-                continue
-            read_fails = 0
-
+        for ev in res.events:
             try:
-                res = self.pipeline.process(frame, ts=loop_start)
-                pipe_errors = 0
+                self.bus.publish(ev, frame=frame)
             except Exception as e:
-                pipe_errors += 1
-                self.status.last_error = repr(e)
-                if pipe_errors <= 3 or pipe_errors % 30 == 0:
-                    print(f"[pipeline cam={cid}] frame error #{pipe_errors}: {e}")
-                    traceback.print_exc()
-                if pipe_errors >= self.MAX_PIPE_ERRORS:
-                    raise
-                self.latest.set(frame)
-                continue
+                log.warning("cam=%s event publish error: %s", cid, e)
 
-            for ev in res.events:
-                try:
-                    self.bus.publish(ev, frame=frame)
-                except Exception as e:
-                    print(f"[pipeline cam={cid}] event publish error: {e}")
-
-            try:
-                annotated = annotate(frame.copy(), res,
-                                     camera_name=self.camera["name"])
-            except Exception as e:
-                print(f"[pipeline cam={cid}] annotate error: {e}")
-                traceback.print_exc()
-                annotated = frame
-            self.latest.set(annotated)
-            self.status.frames_total += 1
-            self.status.fps = res.fps
-
-            max_fps = int(self.pipeline.settings.get("process_fps", 0) or 0)
-            if max_fps > 0:
-                slack = (1.0 / max_fps) - (time.time() - loop_start)
-                if slack > 0 and self._stop_flag.wait(timeout=slack):
-                    break
+        try:
+            annotated = annotate(frame.copy(), res, camera_name=self.camera["name"])
+        except Exception as e:
+            log.exception("cam=%s annotate error: %s", cid, e)
+            annotated = frame
+        self.latest.set(annotated, frame)
+        self.status.frames_total += 1
+        self.status.fps = res.fps
 
 
 # ---- CameraManager --------------------------------------------------------
@@ -349,7 +484,7 @@ class CameraManager:
             try:
                 w.join(timeout=3.0)
             except Exception as e:
-                print(f"[manager] worker join failed: {e}")
+                log.warning("worker join failed: %s", e)
 
     # ---- live (re)config ------------------------------------------------
 
@@ -377,7 +512,7 @@ class CameraManager:
             try:
                 w.join(timeout=3.0)
             except Exception as e:
-                print(f"[manager] camera {camera_id} join failed: {e}")
+                log.warning("camera %s join failed: %s", camera_id, e)
         self.store.delete(camera_id)
 
     def reload_settings(self) -> None:
@@ -391,7 +526,7 @@ class CameraManager:
             try:
                 self.models.ensure_loaded()
             except Exception as e:
-                print(f"[manager] ensure_loaded during reload failed: {e}")
+                log.exception("ensure_loaded during reload failed: %s", e)
 
     # ---- internals ------------------------------------------------------
 
