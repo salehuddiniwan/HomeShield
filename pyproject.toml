@@ -46,6 +46,11 @@ dependencies = [
 
 [project.optional-dependencies]
 plot = ["matplotlib>=3.8.0,<4"]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
 
 [tool.setuptools.dynamic]
 version = { attr = "homeshield.__version__" }
