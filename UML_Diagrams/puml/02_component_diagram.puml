@@ -28,7 +28,7 @@ package "HomeShield (single Flask process)" {
         component "FaceWorker\n(async thread)" as FaceWk <<core>>
         component "EventBus\nevents.py" as EvBus <<core>>
         component "Annotator\nannotator.py" as Ann <<core>>
-        component "Fall FSM\nFall_Detection/\nfall_detection.py" as FallFSM <<core>>
+        component "Fall FSM\ndetectors/fall/\nfsm.py" as FallFSM <<core>>
     }
 
     package "Persistence" {

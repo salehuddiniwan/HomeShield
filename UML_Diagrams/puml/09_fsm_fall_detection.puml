@@ -1,5 +1,5 @@
 @startuml HomeShield FSM - Fall Detection
-title HomeShield - Finite-State Machine (FSM) for Fall Detection\n7 states; thresholds from Fall_Detection/fall_detection.py
+title HomeShield - Finite-State Machine (FSM) for Fall Detection\n7 states; thresholds from homeshield/detectors/fall/config.py
 
 skinparam state {
     BackgroundColor #FFFBEB
@@ -117,7 +117,7 @@ note left of STANDING
   Initial state.
   --
   Thresholds defined in Config()
-  in Fall_Detection/fall_detection.py:
+  in homeshield/detectors/fall/config.py:
     impact_velocity_bu_s   = 1.6
     sustain_s              = 0.5
     horizontal_angle_min   = 60.0

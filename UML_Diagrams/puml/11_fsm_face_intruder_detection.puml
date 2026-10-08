@@ -1,5 +1,5 @@
 @startuml HomeShield FSM - Face / Intruder Detection
-title HomeShield - Finite-State Machine (FSM) for Face and Intruder Detection\nArcFace embedding + cosine match; thresholds from homeshield/face.py + settings.py
+title HomeShield - Finite-State Machine (FSM) for Face and Intruder Detection\nArcFace embedding + cosine match; thresholds from homeshield/detectors/face.py + settings.py
 
 skinparam state {
     BackgroundColor #FFFBEB
@@ -109,7 +109,7 @@ note bottom of MATCH
   Cosine similarity over 512-d
   unit-normalised ArcFace vectors.
   Implementation: best_match() in
-  homeshield/face.py:
+  homeshield/detectors/face.py:
     sims = gallery @ unit(query)
     idx  = argmax(sims)
   Vectorised: one matrix-vector

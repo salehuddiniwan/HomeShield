@@ -20,6 +20,7 @@ from .auth import (ROLE_ADMIN, ROLE_GUEST, UserStore, login_session,
 from .cameras import CameraManager
 from .db import init_db, write_conn
 from .events import Event, EventBus
+from .paths import ICON_DIR
 from .persons import IntruderStore, PersonStore
 from .pipeline import Models, list_fire_models, list_pose_models
 from .settings import SettingsStore
@@ -374,11 +375,10 @@ def create_app(*, db_path: str = "homeshield.db",
 
     # Icons are part of the page chrome (login + dashboard); leave them public
     # so the login screen can render its logo before the user authenticates.
-    icon_dir = (Path(__file__).resolve().parent.parent / "Icon").resolve()
-    if icon_dir.is_dir():
+    if ICON_DIR.is_dir():
         @app.route("/icons/<path:fname>")
         def icon_file(fname: str):
-            return send_from_directory(icon_dir, fname)
+            return send_from_directory(ICON_DIR, fname)
 
     # ===== Events =======================================================
 

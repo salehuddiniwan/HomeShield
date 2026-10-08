@@ -8,13 +8,22 @@ The detector does **not** evaluate frames in isolation. For each tracked person 
 
 ## 1. Project layout
 
+The code lives in the `homeshield.detectors.fall` package; this folder only holds the weights.
+
 ```
-YoloV26/
-├── requirements.txt          # Python dependencies
+homeshield/detectors/fall/
+├── config.py                 # Config dataclass (all thresholds)
+├── features.py               # per-frame skeleton features (numpy only)
+├── fsm.py                    # two-stage detector + per-person FSM (numpy only)
+├── draw.py                   # skeleton / label / HUD drawing (OpenCV)
+└── __main__.py               # standalone webcam / video runner
+
+Fall_Detection/
 ├── README.md                 # This file
-├── fall_detection.py         # Main script
-└── weights/                  # (created by you) put your *.pt model here
+└── weights/                  # put your *-pose.pt models here
 ```
+
+All commands below are run from the repository root.
 
 ---
 
@@ -23,8 +32,8 @@ YoloV26/
 Open **Anaconda Prompt** (or any terminal where `conda` is on PATH) and run:
 
 ```bash
-# Move into the project folder
-cd C:\Users\Admin\Documents\anaconda_projects\YoloV26
+# Move into the repository root
+cd C:\Users\Admin\Documents\anaconda_projects\FYPClaude
 
 # Create a fresh environment with Python 3.11
 conda create -n yolo26 python=3.11 -y
@@ -72,24 +81,18 @@ You should see something like `2.4.0+cu124 True NVIDIA GeForce RTX ...`. If `is_
 pip install -r requirements.txt
 ```
 
-> Do not install `torch` from this file — it was intentionally left out so the GPU build from step 3 is preserved.
+> `torch` is intentionally not listed in the dependencies, so the GPU build from step 3 is preserved.
 
 ---
 
 ## 5. Get the YOLO26 pose weights
 
-Place your YOLO26 pose model into the `weights/` folder. If the folder doesn't exist, create it:
+Drop the `.pt` file into `Fall_Detection/weights/` (e.g. `Fall_Detection/weights/yolo26n-pose.pt`). The runner defaults to `yolo26x-pose.pt` and looks for it in the current directory, then in `Fall_Detection/weights/`. If it isn't found, it falls back to downloading `yolo11n-pose.pt` from Ultralytics' hub the first time it runs.
+
+You can override the model on the command line, by file name or full path:
 
 ```bash
-mkdir weights
-```
-
-Drop the `.pt` file in (e.g. `weights/yolo26n-pose.pt`). The script will look for it automatically. If you don't have a YOLO26 weight yet, the script will fall back to downloading `yolo11n-pose.pt` from Ultralytics' hub the first time it runs.
-
-You can override the path on the command line:
-
-```bash
-python fall_detection.py --model weights/yolo26m-pose.pt
+python -m homeshield.detectors.fall --model yolo26m-pose.pt
 ```
 
 Sizes available (smallest → largest): `n`, `s`, `m`, `l`, `x`. Larger models are more accurate but slower. For real-time on a webcam, `n` or `s` is usually the right pick.
@@ -101,37 +104,37 @@ Sizes available (smallest → largest): `n`, `s`, `m`, `l`, `x`. Larger models a
 **Webcam (default camera 0):**
 
 ```bash
-python fall_detection.py
+python -m homeshield.detectors.fall
 ```
 
 **Video file:**
 
 ```bash
-python fall_detection.py --source path\to\video.mp4
+python -m homeshield.detectors.fall --source path\to\video.mp4
 ```
 
 **Save annotated output:**
 
 ```bash
-python fall_detection.py --source path\to\video.mp4 --save out.mp4
+python -m homeshield.detectors.fall --source path\to\video.mp4 --save out.mp4
 ```
 
 **Run on CPU (force):**
 
 ```bash
-python fall_detection.py --device cpu
+python -m homeshield.detectors.fall --device cpu
 ```
 
 **Headless (no window, just log events):**
 
 ```bash
-python fall_detection.py --source video.mp4 --no-show
+python -m homeshield.detectors.fall --source video.mp4 --no-show
 ```
 
 **Switch tracker** (default is ByteTrack — faster; BoT-SORT is more accurate but slower):
 
 ```bash
-python fall_detection.py --tracker botsort.yaml
+python -m homeshield.detectors.fall --tracker botsort.yaml
 ```
 
 Press `q` in the display window to quit.
@@ -194,7 +197,7 @@ q5 / q6      ──becomes upright──► q0 Standing
 
 ## 8. Tuning
 
-All thresholds live at the top of `fall_detection.py` in the `Config` dataclass. Because of body-scale normalization, the velocity numbers are now portable across cameras — you almost never have to retune them when you change camera distance.
+All thresholds live in the `Config` dataclass in `homeshield/detectors/fall/config.py`. Because of body-scale normalization, the velocity numbers are now portable across cameras — you almost never have to retune them when you change camera distance.
 
 The ones you'll touch most often (also exposed as CLI flags):
 

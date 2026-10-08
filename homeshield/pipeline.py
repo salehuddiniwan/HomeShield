@@ -15,7 +15,6 @@ Edge-triggered events with cooldowns:
 from __future__ import annotations
 
 import queue
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -24,11 +23,10 @@ from typing import Any, Optional
 
 import numpy as np
 
-# Make Fall_Detection importable.
-_THIS = Path(__file__).resolve().parent
-_PROJECT_ROOT = _THIS.parent
-if str(_PROJECT_ROOT / "Fall_Detection") not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT / "Fall_Detection"))
+from . import paths
+from .detectors import fire
+from .detectors.face import FaceEngine, best_match
+from .detectors.fall import Config, MultiPersonState, State
 
 
 # ---- weights resolution ---------------------------------------------------
@@ -59,13 +57,11 @@ def _list_pt(*dirs: Path) -> list[dict[str, str]]:
 
 
 def list_pose_models() -> list[dict[str, str]]:
-    return _list_pt(_PROJECT_ROOT / "Fall_Detection" / "weights",
-                    _PROJECT_ROOT / "weights")
+    return _list_pt(paths.POSE_WEIGHTS_DIR, paths.PROJECT_ROOT / "weights")
 
 
 def list_fire_models() -> list[dict[str, str]]:
-    return _list_pt(_PROJECT_ROOT / "Fire_Detection",
-                    _PROJECT_ROOT / "Fire_Detection" / "weights")
+    return _list_pt(paths.FIRE_WEIGHTS_DIR, paths.FIRE_WEIGHTS_DIR / "weights")
 
 
 # ---- Shared models --------------------------------------------------------
@@ -130,7 +126,7 @@ class Models:
         from ultralytics import YOLO
         weights = self.settings.get("yolo_model", "yolo11n-pose.pt")
         path = resolve_weights(weights, [
-            _PROJECT_ROOT / "Fall_Detection", _PROJECT_ROOT, Path.cwd()
+            paths.POSE_WEIGHTS_DIR, paths.PROJECT_ROOT, Path.cwd()
         ])
         if not Path(path).is_file():
             avail = list_pose_models()
@@ -149,7 +145,7 @@ class Models:
         from ultralytics import YOLO
         weights = self.settings.get("fire_model", "best.pt")
         path = resolve_weights(weights, [
-            _PROJECT_ROOT / "Fire_Detection", _PROJECT_ROOT, Path.cwd()
+            paths.FIRE_WEIGHTS_DIR, paths.PROJECT_ROOT, Path.cwd()
         ])
         if not Path(path).is_file():
             avail = list_fire_models()
@@ -171,7 +167,6 @@ class Models:
     # the attribute name there is "face_engine" not "face_model" — so we
     # alias here for clarity.
     def _load_face(self) -> None:
-        from .face import FaceEngine
         try:
             self.face_engine = FaceEngine()
             if self.face_engine.available:
@@ -256,7 +251,6 @@ class FaceWorker(threading.Thread):
 
     def run(self) -> None:
         from .events import Event
-        from .face import best_match
 
         while not self._stop_flag.is_set():
             try:
@@ -348,7 +342,6 @@ class CameraPipeline:
         self.zone_store = zone_store
         self.intruder_store = intruder_store
 
-        from fall_detection import Config, MultiPersonState, State
         self.cfg = Config(
             model_path=self.models.pose_weights_path or "yolo11n-pose.pt",
             device="auto",
@@ -557,46 +550,19 @@ class CameraPipeline:
             return
         try:
             with self.models.infer_lock:
-                fr = self.models.fire_model.predict(
-                    frame,
+                res.fires = fire.predict(
+                    self.models.fire_model, frame,
                     conf=float(self.settings.get("fire_confidence", 0.35)),
-                    imgsz=self.cfg.imgsz, device=device, verbose=False,
+                    imgsz=self.cfg.imgsz, device=device,
                 )
         except Exception as e:
             print(f"[pipeline.fire cam={self.camera_id}] {e}")
             return
-        if not fr:
-            self._cached_fires = []
-            self._cached_fire_alert = False
-            return
-        r0 = fr[0]
-        if r0.boxes is None or len(r0.boxes) == 0:
-            self._cached_fires = []
-            self._cached_fire_alert = False
-            return
-        names = getattr(r0, "names", None) or {}
-        xyxy = r0.boxes.xyxy.cpu().numpy()
-        confs = r0.boxes.conf.cpu().numpy()
-        clss = r0.boxes.cls.cpu().numpy().astype(int)
-        if xyxy.ndim != 2 or xyxy.shape[1] < 4:
-            xyxy = np.zeros((0, 4), dtype=np.float32)
-            confs = np.zeros((0,), dtype=np.float32)
-            clss = np.zeros((0,), dtype=int)
         per_cls_best: dict[str, tuple[float, tuple]] = {}
-        for row, c, k in zip(xyxy, confs, clss):
-            if len(row) < 4:
-                continue
-            x1, y1, x2, y2 = (float(row[0]), float(row[1]),
-                              float(row[2]), float(row[3]))
-            cls_name = str(names.get(int(k), str(k))).lower()
-            res.fires.append({
-                "bbox": (x1, y1, x2, y2),
-                "conf": float(c),
-                "cls_name": cls_name,
-            })
-            best = per_cls_best.get(cls_name)
-            if best is None or float(c) > best[0]:
-                per_cls_best[cls_name] = (float(c), (x1, y1, x2, y2))
+        for d in res.fires:
+            best = per_cls_best.get(d["cls_name"])
+            if best is None or d["conf"] > best[0]:
+                per_cls_best[d["cls_name"]] = (d["conf"], d["bbox"])
         alert_classes = {
             c.strip().lower()
             for c in str(self.settings.get("fire_classes", "fire,smoke")).split(",")

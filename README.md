@@ -122,7 +122,7 @@ On macOS / Linux (or Windows with MSVC installed), `pip install insightface==0.7
 pip install -r requirements.txt
 ```
 
-The pinned versions avoid two real ABI breaks:
+This installs HomeShield in editable mode (`pip install -e .[plot]`) with the dependencies declared in `pyproject.toml`. The pinned versions avoid two real ABI breaks:
 - `numpy<2.0` — InsightFace wheels are compiled against NumPy 1.x (88-byte dtype struct).
 - `opencv-python<4.11` — OpenCV 4.11+ dropped NumPy 1.x support.
 
@@ -340,8 +340,7 @@ Key design choices:
 
 ```
 FYP/
-├── Fall_Detection/                 # Fall pipeline (imported as a library)
-│   ├── fall_detection.py           #   YOLO pose + 7-state FSM
+├── Fall_Detection/                 # Pose weights + fall-detection guide
 │   ├── weights/                    #   drop any *-pose.pt YOLO weights here
 │   │   ├── yolo11n-pose.pt
 │   │   ├── yolo11m-pose.pt
@@ -349,15 +348,12 @@ FYP/
 │   │   ├── yolo26n-pose.pt
 │   │   ├── yolo26m-pose.pt
 │   │   └── yolo26x-pose.pt
-│   ├── requirements.txt
 │   └── README.md
 │
-├── Fire_Detection/                 # Custom YOLO fire/smoke detector
-│   ├── detect_fire.py
+├── Fire_Detection/                 # Fire/smoke weights
 │   └── best.pt                     #   custom-trained weights
 │
-├── Face_Detection/                 # InsightFace reference + bundled wheels
-│   ├── face_recognizer.py
+├── Face_Detection/                 # Bundled InsightFace wheels (Windows)
 │   ├── insightface-0.7.3-cp310-cp310-win_amd64.whl
 │   └── insightface-0.7.3-cp311-cp311-win_amd64.whl
 │
@@ -385,9 +381,13 @@ FYP/
 │   ├── persons.py                  #   registered persons + intruder log
 │   ├── zones.py                    #   polygon zone storage + point-in-polygon
 │   ├── settings.py                 #   hot-reloadable settings store
-│   ├── face.py                     #   InsightFace embedding + matching helpers
 │   ├── annotator.py                #   bounding boxes, pose skeleton, labels
 │   ├── db.py                       #   SQLite (WAL mode) connection + schema
+│   ├── paths.py                    #   weights / icon folder locations
+│   ├── detectors/                  #   detection back-ends (each runnable via python -m)
+│   │   ├── fall/                   #     YOLO pose features + 7-state FSM + drawing
+│   │   ├── fire.py                 #     YOLO fire/smoke wrapper + CLI
+│   │   └── face.py                 #     InsightFace embedding + matching helpers
 │   ├── static/                     #   compiled CSS + JS
 │   │   ├── app.css
 │   │   └── app.js
@@ -395,7 +395,8 @@ FYP/
 │       └── index.html              #   single-page dashboard UI
 │
 ├── run_homeshield.py               # Entry point (argparse + create_app)
-├── requirements.txt                # Pinned, ABI-consistent deps
+├── pyproject.toml                  # Package metadata + pinned, ABI-consistent deps
+├── requirements.txt                # Installs the package (-e .[plot])
 ├── homeshield.db                   # SQLite event/persons/zones/users store (created on first run)
 ├── snapshots/                      # Annotated event JPEGs (gitignored)
 ├── person_photos/                  # Enrolment photos for known persons (gitignored)

@@ -2,27 +2,10 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import cv2
 import numpy as np
 
-# Pull the FSM colour palette + skeleton drawer from Fall_Detection.
-_FALL_DIR = Path(__file__).resolve().parent.parent / "Fall_Detection"
-if str(_FALL_DIR) not in sys.path:
-    sys.path.insert(0, str(_FALL_DIR))
-
-
-def _import_palette():
-    try:
-        from fall_detection import STATE_COLOR, draw_skeleton  # type: ignore
-        return STATE_COLOR, draw_skeleton
-    except Exception:
-        return {}, None
-
-
-_STATE_COLOR, _draw_skeleton = _import_palette()
+from .detectors.fall.draw import STATE_COLOR, draw_skeleton
 
 # BGR colours
 COLOR_FIRE = (40, 60, 230)
@@ -107,10 +90,10 @@ def _draw_persons(frame, persons, kp_conf_min):
             continue
         x1, y1, x2, y2 = (int(v) for v in bb)
         det = p["detector"]
-        color = _STATE_COLOR.get(det.state, (200, 200, 200)) if det else (200, 200, 200)
-        if p.get("kpts") is not None and _draw_skeleton is not None:
+        color = STATE_COLOR.get(det.state, (200, 200, 200)) if det else (200, 200, 200)
+        if p.get("kpts") is not None:
             try:
-                _draw_skeleton(frame, p["kpts"], kp_conf_min)
+                draw_skeleton(frame, p["kpts"], kp_conf_min)
             except Exception:
                 pass
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)

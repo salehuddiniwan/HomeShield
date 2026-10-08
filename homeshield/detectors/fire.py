@@ -1,22 +1,16 @@
 """
-Fire detection using local YOLO weights.
+Fire / smoke detection using local YOLO weights.
 
-Runs inference on images, videos, or your webcam.
+Library use (from the pipeline):
+    fires = predict(model, frame, conf=0.35, imgsz=640, device=0)
+    # -> [{"bbox": (x1, y1, x2, y2), "conf": float, "cls_name": "fire"}, ...]
 
-Usage examples
---------------
-# Image (single file or folder of images)
-python detect_fire.py --weights fire_detector.pt --source path/to/image.jpg
-python detect_fire.py --weights fire_detector.pt --source path/to/folder
-
-# Video
-python detect_fire.py --weights fire_detector.pt --source path/to/video.mp4
-
-# Webcam (device 0 by default)
-python detect_fire.py --weights fire_detector.pt --source 0 --show
-
-# Adjust confidence threshold and pick output folder
-python detect_fire.py --weights fire_detector.pt --source image.jpg --conf 0.4 --out runs/fire
+Standalone inference on images, videos, or a webcam:
+    python -m homeshield.detectors.fire --source path/to/image.jpg
+    python -m homeshield.detectors.fire --source path/to/folder
+    python -m homeshield.detectors.fire --source path/to/video.mp4
+    python -m homeshield.detectors.fire --source 0 --show
+    python -m homeshield.detectors.fire --source image.jpg --conf 0.4 --out runs/fire
 """
 
 from __future__ import annotations
@@ -24,6 +18,13 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from ..paths import FIRE_WEIGHTS_DIR
+
+DEFAULT_WEIGHTS = FIRE_WEIGHTS_DIR / "best.pt"
 
 
 def load_model(weights_path: str):
@@ -39,6 +40,38 @@ def load_model(weights_path: str):
     return YOLO(weights_path)
 
 
+def parse_result(r0) -> list[dict[str, Any]]:
+    """Flatten one Ultralytics detect result into homeshield fire dicts."""
+    if r0.boxes is None or len(r0.boxes) == 0:
+        return []
+    names = getattr(r0, "names", None) or {}
+    xyxy = r0.boxes.xyxy.cpu().numpy()
+    confs = r0.boxes.conf.cpu().numpy()
+    clss = r0.boxes.cls.cpu().numpy().astype(int)
+    if xyxy.ndim != 2 or xyxy.shape[1] < 4:
+        xyxy = np.zeros((0, 4), dtype=np.float32)
+        confs = np.zeros((0,), dtype=np.float32)
+        clss = np.zeros((0,), dtype=int)
+    fires: list[dict[str, Any]] = []
+    for row, c, k in zip(xyxy, confs, clss):
+        if len(row) < 4:
+            continue
+        fires.append({
+            "bbox": (float(row[0]), float(row[1]), float(row[2]), float(row[3])),
+            "conf": float(c),
+            "cls_name": str(names.get(int(k), str(k))).lower(),
+        })
+    return fires
+
+
+def predict(model, frame, *, conf: float, imgsz: int, device) -> list[dict[str, Any]]:
+    """Run the fire model on one BGR frame. Not thread-safe: callers serialize."""
+    fr = model.predict(frame, conf=conf, imgsz=imgsz, device=device, verbose=False)
+    return parse_result(fr[0]) if fr else []
+
+
+# ---- CLI ------------------------------------------------------------------
+
 def parse_source(src: str):
     """Treat purely numeric source as a webcam device index."""
     if src.isdigit():
@@ -47,12 +80,14 @@ def parse_source(src: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="YOLO fire detection inference")
+    parser = argparse.ArgumentParser(
+        prog="python -m homeshield.detectors.fire",
+        description="YOLO fire detection inference")
     parser.add_argument(
         "--weights",
         type=str,
-        default="best.pt",
-        help="Path to the local YOLO weights file (e.g., fire_detector.pt)",
+        default=str(DEFAULT_WEIGHTS),
+        help="Path to the local YOLO weights file (default: Fire_Detection/best.pt)",
     )
     parser.add_argument(
         "--source",

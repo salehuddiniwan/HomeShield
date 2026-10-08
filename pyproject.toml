@@ -1,0 +1,57 @@
+# HomeShield packaging. Tested on Windows 11 + Python 3.11 + CUDA 12.x.
+#
+# Install order matters:
+#   1. PyTorch FIRST, from the CUDA index (otherwise pip pulls the CPU build):
+#        pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#   2. On Windows without MSVC, InsightFace from the bundled wheel:
+#        pip install Face_Detection/insightface-0.7.3-cp311-cp311-win_amd64.whl
+#   3. HomeShield itself (editable, so code edits apply without reinstalling):
+#        pip install -e .
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "homeshield"
+description = "Centralized dashboard for real-time CCTV monitoring and anomaly detection"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"   # bundled InsightFace wheels cover 3.10 / 3.11
+dynamic = ["version"]
+dependencies = [
+    # Detection / CV
+    "ultralytics==8.3.39",
+    "opencv-python>=4.9.0,<4.11",      # 4.11+ drops NumPy 1.x
+    "numpy>=1.26.0,<2.0",              # InsightFace ABI requires NumPy 1.x
+    "scipy>=1.11.0,<1.14",
+    "PyYAML>=6.0",
+    "tqdm>=4.66.0",
+    "Pillow>=10.0.0",
+    "shapely>=2.0.0",
+
+    # Face recognition
+    "insightface==0.7.3",
+    "onnxruntime-gpu>=1.17.0,<2.0; platform_system != 'Darwin'",
+    "onnxruntime>=1.17.0,<2.0; platform_system == 'Darwin'",
+
+    # Web dashboard
+    "Flask>=3.0.0,<4",
+    "Werkzeug>=3.0.0,<4",
+    "Jinja2>=3.1.0",
+    "itsdangerous>=2.1.0",
+    "click>=8.1.0",
+    "blinker>=1.7.0",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.8.0,<4"]
+
+[tool.setuptools.dynamic]
+version = { attr = "homeshield.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["homeshield*"]
+
+[tool.setuptools.package-data]
+homeshield = ["static/*", "templates/*"]

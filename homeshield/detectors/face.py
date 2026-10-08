@@ -1,29 +1,19 @@
-"""InsightFace wrapper. Prefers Face_Detection/face_recognizer.py if importable;
-falls back to a direct FaceAnalysis init with explicit providers."""
+"""Face recognition using InsightFace.
+
+Provides:
+  * Face detection + 512-d ArcFace embedding (+ age / gender estimates)
+  * Gallery matching via cosine similarity
+
+If InsightFace isn't installed the module still imports cleanly and
+`FaceEngine.available` is False — all callers must check.
+"""
 
 from __future__ import annotations
 
-import sys
 import threading
-from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
-
-# Make Face_Detection/ importable like fall_detection/.
-_THIS = Path(__file__).resolve().parent
-_FACE_DIR = _THIS.parent / "Face_Detection"
-if _FACE_DIR.is_dir() and str(_FACE_DIR) not in sys.path:
-    sys.path.insert(0, str(_FACE_DIR))
-
-
-def _try_import_user_face_recognizer():
-    try:
-        from face_recognizer import FaceRecognizer  # type: ignore
-        return FaceRecognizer
-    except Exception as e:
-        print(f"[face] Face_Detection/face_recognizer.py not loadable: {e}")
-        return None
 
 
 def _try_import_face_analysis():
@@ -46,7 +36,9 @@ def _cuda_available() -> bool:
 class FaceEngine:
     """Thread-safe face detector + ArcFace embedder."""
 
-    DEFAULT_THRESHOLD = 0.42  # matches Face_Detection/face_recognizer.py
+    # Cosine similarity for "this is person X".
+    # InsightFace ArcFace: 0.40 is permissive, 0.50 is strict.
+    DEFAULT_THRESHOLD = 0.42
 
     def __init__(self, model_name: str = "buffalo_l",
                  det_size: tuple[int, int] = (640, 640),
@@ -54,35 +46,12 @@ class FaceEngine:
         self.available: bool = False
         self.last_error: Optional[str] = None
         self._lock = threading.Lock()
-        self._app = None              # raw FaceAnalysis (fallback path)
-        self._user_recognizer = None  # user's FaceRecognizer (preferred path)
+        self._app = None
 
         use_gpu = prefer_gpu and _cuda_available()
-
-        if self._try_user_recognizer(use_gpu):
-            return
         self._try_face_analysis(model_name, det_size, use_gpu)
 
     # ---- init helpers ---------------------------------------------------
-
-    def _try_user_recognizer(self, use_gpu: bool) -> bool:
-        FaceRecognizer = _try_import_user_face_recognizer()
-        if FaceRecognizer is None:
-            return False
-        for gpu in ([True, False] if use_gpu else [False]):
-            try:
-                rec = FaceRecognizer(use_gpu=gpu)
-                if rec.is_enabled():
-                    self._user_recognizer = rec
-                    self.available = True
-                    print(f"[face] using Face_Detection/face_recognizer.py (GPU={gpu})")
-                    return True
-            except Exception as e:
-                self.last_error = f"FaceRecognizer init: {type(e).__name__}: {e}"
-                print(f"[face] FaceRecognizer init failed (gpu={gpu}): {e}")
-        if not self.last_error:
-            self.last_error = "FaceRecognizer.is_enabled() returned False"
-        return False
 
     def _try_face_analysis(self, model_name: str,
                            det_size: tuple[int, int], use_gpu: bool) -> bool:
@@ -103,7 +72,7 @@ class FaceEngine:
                 self._app = app
                 self.available = True
                 self.last_error = None
-                print(f"[face] direct FaceAnalysis ready ({providers}, {det_size})")
+                print(f"[face] FaceAnalysis ready ({providers}, {det_size})")
                 return True
             except Exception as e:
                 self.last_error = f"{type(e).__name__}: {e}"
@@ -113,15 +82,12 @@ class FaceEngine:
     # ---- public API -----------------------------------------------------
 
     def detect(self, frame_bgr) -> list[dict[str, Any]]:
-        if not self.available or frame_bgr is None or frame_bgr.size == 0:
-            return []
-        backend = (self._user_recognizer._app
-                   if self._user_recognizer is not None else self._app)
-        if backend is None:
+        if (not self.available or self._app is None
+                or frame_bgr is None or frame_bgr.size == 0):
             return []
         with self._lock:
             try:
-                faces = backend.get(frame_bgr)
+                faces = self._app.get(frame_bgr)
             except Exception as e:
                 self.last_error = f"detect: {e}"
                 return []
