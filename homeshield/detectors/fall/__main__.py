@@ -104,13 +104,23 @@ def run(cfg, source):
         if writer is not None:
             writer.write(frame)
         if cfg.show:
-            cv2.imshow("YOLO26 Fall Detection - press q to quit", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
+            try:
+                cv2.imshow("YOLO26 Fall Detection - press q to quit", frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+            except cv2.error:
+                # opencv-python-headless (pulled in by insightface's
+                # albumentations) can end up providing cv2: no GUI support.
+                print("[display] this OpenCV build has no window support; "
+                      "continuing without a window. To get one back:\n"
+                      "  pip install --force-reinstall --no-deps "
+                      f"\"opencv-python~={cv2.__version__}\"")
+                cfg.show = False
     cap.release()
     if writer is not None:
         writer.release()
-    cv2.destroyAllWindows()
+    if cfg.show:
+        cv2.destroyAllWindows()
 
 
 def parse_args():

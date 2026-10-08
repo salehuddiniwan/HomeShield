@@ -42,7 +42,7 @@ def _models(pose=None, face=None):
 
 
 def test_each_camera_gets_its_own_tracker(monkeypatch):
-    monkeypatch.setattr(pipeline_mod, "_new_trackers", lambda yaml: [_Tracker()])
+    monkeypatch.setattr(pipeline_mod, "_new_trackers", lambda predictor: [_Tracker()])
     models = _models(pose=_PoseModel())
     settings = {"fire_enabled": False}
     cams = {cid: CameraPipeline(camera_id=cid, camera_name=str(cid),

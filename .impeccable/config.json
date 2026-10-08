@@ -5,5 +5,29 @@
       "maxFindings": 5,
       "maxChars": 8000
     }
+  },
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "low-contrast",
+        "value": "*",
+        "files": [
+          "decoded_template.html"
+        ],
+        "createdAt": "2026-10-08T17:15:33.913Z",
+        "reason": "Direction contract specifies #e8002a as signal red (critical/alert); brightening to AA-compliant orange-red erases alarm semantics; danger state uses multi-cue redundancy (border-left + row tint + color)"
+      },
+      {
+        "rule": "broken-image",
+        "value": "*",
+        "files": [
+          "decoded_template.html"
+        ],
+        "createdAt": "2026-10-08T17:19:06.049Z",
+        "reason": "Remaining img tags are (a) runtime /video_feed/{cameraId} streams — live content, not static assets; src contains JS template expressions that the static scanner cannot resolve; onerror fallbacks are present on all instances"
+      }
+    ]
   }
 }

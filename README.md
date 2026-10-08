@@ -90,21 +90,23 @@ source venv/bin/activate
 ```
 
 ### 3. Install PyTorch (do this BEFORE requirements.txt)
-**This step is critical.** If you let pip resolve PyTorch from `requirements.txt`, it will pull the **CPU-only** build and silently overwrite a working CUDA install. Install PyTorch with the matching CUDA index URL **first**:
+**This step is critical.** If you let pip resolve PyTorch from `requirements.txt`, it will pull the **CPU-only** build. Install PyTorch from a CUDA index **first**, and note which CUDA version you picked; step 5 has to match it:
 
 ```bash
-# CUDA 12.x (recommended)
+# CUDA 12 (recommended; NVIDIA driver 525 or newer)
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
-# CPU-only fallback (no GPU available)
+# CUDA 13 (NVIDIA driver 580 or newer)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+
+# CPU-only fallback (no NVIDIA GPU)
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 ```
 
-Verify CUDA is detected:
+Run `nvidia-smi` to see your driver version. Verify CUDA is detected:
 
 ```bash
-python -c "import torch; print('cuda', torch.cuda.is_available())"
-# cuda True
+python -c "import torch; print('cuda', torch.cuda.is_available(), torch.version.cuda)"
 ```
 
 ### 4. Install InsightFace (Windows-specific)
@@ -114,33 +116,53 @@ On Windows without MSVC build tools, pip cannot compile InsightFace from source.
 pip install Face_Detection/insightface-0.7.3-cp311-cp311-win_amd64.whl
 ```
 
-On macOS / Linux (or Windows with MSVC installed), `pip install insightface==0.7.3` works directly and `requirements.txt` will handle it.
+(Use the `cp310` wheel on Python 3.10.) On macOS / Linux, or Windows with MSVC installed, `pip install insightface==0.7.3` works directly and step 5 handles it.
 
 ### 5. Install the rest
+
+`requirements.txt` installs HomeShield in editable mode with the **CUDA 12** build of ONNX Runtime (which runs the face models):
 
 ```bash
 pip install -r requirements.txt
 ```
 
-This installs HomeShield in editable mode (`pip install -e .[plot]`) with the dependencies declared in `pyproject.toml`. The pinned versions avoid two real ABI breaks:
-- `numpy<2.0` — InsightFace wheels are compiled against NumPy 1.x (88-byte dtype struct).
-- `opencv-python<4.11` — OpenCV 4.11+ dropped NumPy 1.x support.
+If you installed the CUDA 13 or CPU build of PyTorch in step 3, install the matching extra instead:
+
+```bash
+pip install -e .[plot,cuda13]
+```
+
+```bash
+pip install -e .[plot,cpu]
+```
+
+ONNX Runtime's CUDA version must match PyTorch's (`onnxruntime-gpu` 1.27+ needs CUDA 13, 1.26 and older need CUDA 12). With a mismatch, face recognition silently falls back to the CPU; HomeShield logs a warning naming the fix, and `/healthz` reports `face_device`.
+
+The other pins avoid real breakages:
+- `numpy<2.0`: InsightFace wheels are compiled against NumPy 1.x.
+- `opencv-python` and `opencv-python-headless` are both kept on 4.10.x. Ultralytics needs the first and InsightFace's `albumentations` the second, and both install into the same `cv2` folder.
+- `lap` is required by the person tracker (Ultralytics 8.3 and 8.4 both import it). HomeShield also turns off Ultralytics' auto-installer, which otherwise runs whatever `pip` is on your PATH and can install into a different Python.
+
+Whichever OpenCV package was written last provides `cv2`. The dashboard works with either. Only the standalone fall runner's `--show` window needs the GUI build; if it reports that the window is unavailable, restore it with:
+
+```bash
+pip install --force-reinstall --no-deps "opencv-python~=4.10.0"
+```
 
 Verify the full stack loads cleanly:
 
 ```bash
-python -c "import torch, cv2, ultralytics, insightface, flask; \
-           print('torch', torch.__version__, 'cuda', torch.cuda.is_available()); \
-           print('cv2', cv2.__version__); \
-           print('insightface', insightface.__version__)"
+python -c "import torch, cv2, ultralytics, insightface, onnxruntime, lap; print('torch', torch.__version__, 'cuda', torch.cuda.is_available()); print('cv2', cv2.__version__); print('onnxruntime', onnxruntime.__version__, onnxruntime.get_available_providers())"
 ```
 
-Expected output:
+Optionally run the tests (no GPU or weights needed):
 
+```bash
+pip install pytest
 ```
-torch 2.x.x cuda True
-cv2 4.10.0.84
-insightface 0.7.3
+
+```bash
+python -m pytest
 ```
 
 ### 6. Configure
@@ -351,7 +373,7 @@ Key design choices:
 python -m pytest
 ```
 
-The suite runs in a few seconds without a GPU or model weights. It covers the fall FSM on synthetic skeleton tracks (falls vs. sitting, bending and lying down slowly, at 3–30 FPS), per-camera tracker isolation, fire and intruder confirmation, zones, face matching and the frame grabber.
+Install it first with `pip install pytest`. The suite runs in a few seconds without a GPU or model weights. It covers the fall FSM on synthetic skeleton tracks (falls vs. sitting, bending and lying down slowly, at 3–30 FPS), per-camera tracker isolation, fire and intruder confirmation, zones, face matching and the frame grabber.
 
 ---
 
@@ -416,7 +438,7 @@ FYP/
 ├── tests/                          # pytest suite (+ synthetic skeleton tracks)
 ├── run_homeshield.py               # Entry point (argparse + create_app)
 ├── pyproject.toml                  # Package metadata + pinned, ABI-consistent deps
-├── requirements.txt                # Installs the package (-e .[plot])
+├── requirements.txt                # Installs the package (-e .[plot,cuda12])
 ├── homeshield.db                   # SQLite event/persons/zones/users store (created on first run)
 ├── snapshots/                      # Annotated event JPEGs (gitignored)
 ├── person_photos/                  # Enrolment photos for known persons (gitignored)
@@ -466,7 +488,7 @@ Bottlenecks, in practice:
 You ended up on NumPy 2.x. Pin back to NumPy 1.x: `pip install "numpy<2.0"`.
 
 **`torch.cuda.is_available()` is `False`**
-You either installed the CPU-only PyTorch build, or your NVIDIA driver / CUDA runtime is mismatched. Reinstall PyTorch with `--index-url https://download.pytorch.org/whl/cu121` **after** uninstalling the existing torch.
+You either installed the CPU-only PyTorch build, or your NVIDIA driver / CUDA runtime is mismatched. Reinstall PyTorch from the CUDA index you chose in step 3 (e.g. `--index-url https://download.pytorch.org/whl/cu130`) **after** uninstalling the existing torch.
 
 **InsightFace fails to install on Windows**
 Use the bundled wheel: `pip install Face_Detection/insightface-0.7.3-cp311-cp311-win_amd64.whl`. The wheel is built for **Python 3.11 / Windows x64** specifically.

@@ -10,13 +10,21 @@ If InsightFace isn't installed the module still imports cleanly and
 
 from __future__ import annotations
 
+import contextlib
+import io
 import logging
 import threading
+import warnings
 from typing import Any, Optional
 
 import numpy as np
 
 log = logging.getLogger(__name__)
+
+# InsightFace 0.7.3 calls np.linalg.lstsq without rcond and skimage's
+# deprecated SimilarityTransform.estimate. Both still work; the warnings are
+# only noise in the console.
+warnings.filterwarnings("ignore", category=FutureWarning, module=r"insightface\.")
 
 
 def _try_import_face_analysis():
@@ -48,6 +56,7 @@ class FaceEngine:
                  prefer_gpu: bool = True):
         self.available: bool = False
         self.last_error: Optional[str] = None
+        self.device: str = "none"     # "cuda" | "cpu" once loaded
         self._lock = threading.Lock()
         self._app = None
 
@@ -70,17 +79,46 @@ class FaceEngine:
             providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
                          if gpu else ["CPUExecutionProvider"])
             try:
-                app = FaceAnalysis(name=model_name, providers=providers)
-                app.prepare(ctx_id=0 if gpu else -1, det_size=det_size)
+                # InsightFace print()s a "find model" / "Applied providers"
+                # line per model; keep them for --debug only.
+                chatter = io.StringIO()
+                with contextlib.redirect_stdout(chatter):
+                    app = FaceAnalysis(name=model_name, providers=providers)
+                    app.prepare(ctx_id=0 if gpu else -1, det_size=det_size)
+                for line in chatter.getvalue().splitlines():
+                    if line.strip():
+                        log.debug("insightface: %s", line)
                 self._app = app
                 self.available = True
                 self.last_error = None
-                log.info("FaceAnalysis ready (%s, %s)", providers, det_size)
+                self.device = self._session_device(app)
+                log.info("FaceAnalysis ready on %s (det_size=%s)", self.device, det_size)
+                if gpu and self.device != "cuda":
+                    # ONNX Runtime drops to CPU with only a console message
+                    # when its CUDA build doesn't match the CUDA libraries
+                    # PyTorch ships (e.g. onnxruntime-gpu 1.27+ needs CUDA 13).
+                    import onnxruntime
+                    import torch
+                    log.warning(
+                        "face recognition is running on the CPU: onnxruntime-gpu %s "
+                        "could not use CUDA with PyTorch %s (CUDA %s). Install the "
+                        "matching build: pip install -e .[cuda13] for CUDA 13, "
+                        ".[cuda12] for CUDA 12.",
+                        onnxruntime.__version__, torch.__version__, torch.version.cuda)
                 return True
             except Exception as e:
                 self.last_error = f"{type(e).__name__}: {e}"
                 log.warning("FaceAnalysis init failed (gpu=%s): %s", gpu, e)
         return False
+
+    @staticmethod
+    def _session_device(app) -> str:
+        """'cuda' if the detector's ONNX session actually runs on CUDA."""
+        try:
+            providers = app.models["detection"].session.get_providers()
+        except Exception:
+            return "unknown"
+        return "cuda" if "CUDAExecutionProvider" in providers else "cpu"
 
     # ---- public API -----------------------------------------------------
 

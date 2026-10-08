@@ -1,6 +1,10 @@
 # Dependencies are declared in pyproject.toml; this file just installs them.
-# Install PyTorch FIRST, separately (see pyproject.toml for the full order):
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-# On Windows w/o MSVC, install InsightFace from the bundled wheel first:
-#   pip install Face_Detection/insightface-0.7.3-cp311-cp311-win_amd64.whl
--e .[plot]
+# 1. Install PyTorch FIRST, separately, from a CUDA index:
+#      pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# 2. On Windows w/o MSVC, install InsightFace from the bundled wheel:
+#      pip install Face_Detection/insightface-0.7.3-cp311-cp311-win_amd64.whl
+# 3. pip install -r requirements.txt
+#
+# [cuda12] matches PyTorch cu121-cu128. For PyTorch cu130 use [plot,cuda13]
+# instead, and [plot,cpu] without an NVIDIA GPU (see pyproject.toml).
+-e .[plot,cuda12]

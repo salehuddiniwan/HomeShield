@@ -70,13 +70,17 @@ def list_fire_models() -> list[dict[str, str]]:
     return _list_pt(paths.FIRE_WEIGHTS_DIR, paths.FIRE_WEIGHTS_DIR / "weights")
 
 
-def _new_trackers(tracker_yaml: str) -> list:
-    """Fresh tracker list, built the same way Ultralytics' on_predict_start does."""
-    from ultralytics.trackers.track import TRACKER_MAP
-    from ultralytics.utils import IterableSimpleNamespace, yaml_load
-    from ultralytics.utils.checks import check_yaml
-    cfg = IterableSimpleNamespace(**yaml_load(check_yaml(tracker_yaml)))
-    return [TRACKER_MAP[cfg.tracker_type](args=cfg, frame_rate=30)]
+def _new_trackers(predictor) -> list:
+    """Fresh tracker list for `predictor`, built by Ultralytics itself.
+
+    on_predict_start(persist=False) always rebuilds `predictor.trackers` from
+    the predictor's tracker config. Calling it (rather than re-implementing
+    it) keeps this working across Ultralytics versions: 8.4 moved the YAML
+    loader and added a re-ID hook for BoT-SORT.
+    """
+    from ultralytics.trackers.track import on_predict_start
+    on_predict_start(predictor, persist=False)
+    return predictor.trackers
 
 
 # ---- Shared models --------------------------------------------------------
@@ -420,6 +424,7 @@ class CameraPipeline:
         self.fall_state = MultiPersonState(self.cfg)
         # This camera's own ByteTrack state (see _track()).
         self._trackers: Optional[list] = None
+        self._pose_errors = 0
         # track id -> {"person_id", "name", "category"} once a face is recognised
         self._identity: dict[int, dict[str, Any]] = {}
 
@@ -518,7 +523,7 @@ class CameraPipeline:
         pred = model.predictor
         if pred is not None and hasattr(pred, "trackers"):
             if self._trackers is None:
-                self._trackers = _new_trackers(self.cfg.tracker)
+                self._trackers = _new_trackers(pred)
             pred.trackers = self._trackers
         out = model.track(
             frame,
@@ -538,8 +543,13 @@ class CameraPipeline:
                 tr = self._track(model, frame, device)
             if tr:
                 res.persons = self.fall_state.step(tr[0], H, W, ts)
+            self._pose_errors = 0
         except Exception as e:
-            log.warning("pose cam=%s: %s", self.camera_id, e)
+            # A persistent error would otherwise log once per frame.
+            self._pose_errors += 1
+            if self._pose_errors <= 3 or self._pose_errors % 300 == 0:
+                log.exception("pose cam=%s (error #%d): %s",
+                              self.camera_id, self._pose_errors, e)
 
     def _attach_identities(self, res: FrameResult) -> None:
         """Remember who each track is once their face is recognised.

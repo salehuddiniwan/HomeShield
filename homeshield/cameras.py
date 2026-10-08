@@ -321,6 +321,9 @@ class CaptureWorker(threading.Thread):
                 self._throttle(loop_start)
         finally:
             grabber.stop()      # the grabber releases the capture itself
+            # Give it a moment to do so, so an immediate reconnect to the same
+            # device (e.g. webcam 0) doesn't find it still open.
+            grabber.join(timeout=2.0)
 
     def _loop_file(self, cap: cv2.VideoCapture) -> None:
         """Video files: every frame, timestamped by the file's own clock and

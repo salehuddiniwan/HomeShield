@@ -17,7 +17,7 @@ import threading
 from functools import wraps
 from typing import Any, Optional
 
-from flask import jsonify, session
+from flask import current_app, jsonify, session
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from .db import read_conn, write_conn
@@ -228,28 +228,45 @@ def logout_session() -> None:
 
 # ---- decorators -----------------------------------------------------------
 
+def _denied(admin: bool):
+    """Return an error response if the current request may not proceed.
+
+    Role and must-change status are read from the DB on every request, not
+    from the session cookie: otherwise a deleted or demoted user kept their
+    old rights, and an admin-forced password reset was ignored, until that
+    user's session expired (up to 12 h).
+    """
+    uid = session_user_id()
+    if uid is None:
+        return jsonify({"error": "auth_required"}), 401
+    store = current_app.extensions.get("homeshield_users")
+    if store is not None:
+        row = store.get(uid)
+        if row is None:
+            session.clear()
+            return jsonify({"error": "auth_required"}), 401
+        role, must_change = row["role"], bool(row["must_change"])
+    else:
+        role, must_change = session_role(), session_must_change()
+    if must_change:
+        # The only thing a must-change user is allowed to do is set a new
+        # password. Treat everything else as auth-required so the frontend
+        # re-renders the change-password overlay.
+        return jsonify({"error": "password_change_required"}), 401
+    if admin and role != ROLE_ADMIN:
+        return jsonify({"error": "admin_required"}), 403
+    return None
+
+
 def require_login(view):
     @wraps(view)
     def wrapper(*args, **kwargs):
-        if session_user_id() is None:
-            return jsonify({"error": "auth_required"}), 401
-        if session_must_change():
-            # The only thing a must-change user is allowed to do is set a
-            # new password. Treat everything else as auth-required so the
-            # frontend re-renders the change-password overlay.
-            return jsonify({"error": "password_change_required"}), 401
-        return view(*args, **kwargs)
+        return _denied(admin=False) or view(*args, **kwargs)
     return wrapper
 
 
 def require_admin(view):
     @wraps(view)
     def wrapper(*args, **kwargs):
-        if session_user_id() is None:
-            return jsonify({"error": "auth_required"}), 401
-        if session_must_change():
-            return jsonify({"error": "password_change_required"}), 401
-        if session_role() != ROLE_ADMIN:
-            return jsonify({"error": "admin_required"}), 403
-        return view(*args, **kwargs)
+        return _denied(admin=True) or view(*args, **kwargs)
     return wrapper
