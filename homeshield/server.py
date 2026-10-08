@@ -16,7 +16,7 @@ from flask import (Flask, Response, abort, jsonify, render_template, request,
 
 from .auth import (ROLE_ADMIN, ROLE_GUEST, UserStore, login_session,
                    logout_session, require_admin, require_login,
-                   session_must_change, session_user_id)
+                   session_user_id)
 from .cameras import CameraManager
 from .db import init_db, write_conn
 from .detectors.face import is_good_face
@@ -190,16 +190,19 @@ def create_app(*, db_path: str = "homeshield.db",
         uid = session_user_id()
         if uid is None:
             return jsonify({"error": "auth_required"}), 401
+        row = user_store.get(uid)
+        if row is None:
+            logout_session()
+            return jsonify({"error": "auth_required"}), 401
         data = request.get_json(silent=True) or {}
         new_pw = str(data.get("new_password", ""))
-        # If the user is NOT on a must-change flow, require their current pw.
-        if not session_must_change():
+        # Require the current password unless the account is flagged for a
+        # forced change. Read the flag from the DB, not the session: an admin
+        # reset made after this user logged in only exists in the DB, and the
+        # change-password screen it triggers doesn't ask for the old password.
+        if not row["must_change"]:
             current = str(data.get("current_password", ""))
-            row = user_store.get(uid)
-            if row is None:
-                return jsonify({"error": "auth_required"}), 401
-            verified = user_store.verify(row["username"], current)
-            if verified is None:
+            if user_store.verify(row["username"], current) is None:
                 return jsonify({"error": "current password is incorrect"}), 400
         try:
             user_store.update_password(uid, new_pw)
@@ -473,6 +476,13 @@ def create_app(*, db_path: str = "homeshield.db",
 
     # ===== Persons ======================================================
 
+    def _face_ok(face: dict[str, Any]) -> bool:
+        return is_good_face(
+            face,
+            min_size=float(settings.get("face_min_size", 40)),
+            min_det_score=float(settings.get("face_min_det_score", 0.6)),
+        )
+
     @app.route("/api/persons")
     @require_admin
     def api_persons():
@@ -506,9 +516,7 @@ def create_app(*, db_path: str = "homeshield.db",
         face = models.face_engine.best_face(frame)
         if not face or face.get("embedding") is None:
             return jsonify({"error": "No face found in frame"}), 400
-        if not is_good_face(face,
-                            min_size=float(settings.get("face_min_size", 40)),
-                            min_det_score=float(settings.get("face_min_det_score", 0.6))):
+        if not _face_ok(face):
             return jsonify({"error": "Face too small or unclear - move closer to "
                                      "the camera and face it directly"}), 400
         info = person_store.add(
@@ -548,6 +556,9 @@ def create_app(*, db_path: str = "homeshield.db",
                 "x": face["x"], "y": face["y"],
                 "w": face["w"], "h": face["h"],
                 "age": face.get("age"),
+                # Same gate as enrolment, so the preview never offers to
+                # capture a face the server would then reject.
+                "quality_ok": _face_ok(face),
             },
             "width": w, "height": h,
         })
