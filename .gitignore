@@ -85,3 +85,9 @@ drafts/
 *.bak
 *.tmp
 *.orig
+
+# ---- Literature for the FYP report (kept locally, not versioned) ----
+REFERENCE/
+
+# ---- Impeccable working files ----
+decoded_template.html

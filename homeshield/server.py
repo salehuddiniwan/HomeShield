@@ -2,26 +2,25 @@
 
 from __future__ import annotations
 
-import logging
 import json
+import logging
 import os
 import queue
 import secrets
-import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 from flask import (Flask, Response, abort, jsonify, render_template, request,
-                   send_from_directory, session)
+                   send_from_directory)
 
 from .auth import (ROLE_ADMIN, ROLE_GUEST, UserStore, login_session,
                    logout_session, require_admin, require_login,
-                   session_must_change, session_role, session_user_id)
+                   session_must_change, session_user_id)
 from .cameras import CameraManager
 from .db import init_db, write_conn
 from .detectors.face import is_good_face
-from .events import Event, EventBus
+from .events import EventBus
 from .paths import ICON_DIR
 from .persons import IntruderStore, PersonStore
 from .pipeline import Models, list_fire_models, list_pose_models
@@ -42,23 +41,39 @@ _FLOAT_KEYS = ("fall_threshold", "yolo_confidence", "fire_confidence",
 _BOOL_KEYS = ("use_fp16", "fall_enabled", "fire_enabled", "face_enabled")
 
 
-def _coerce_settings(data: dict[str, Any]) -> dict[str, Any]:
-    for k in _INT_KEYS:
-        if k in data and data[k] is not None:
-            try:
-                data[k] = int(data[k])
-            except Exception:
-                pass
-    for k in _FLOAT_KEYS:
-        if k in data and data[k] is not None:
-            try:
-                data[k] = float(data[k])
-            except Exception:
-                pass
+def _to_bool(v: Any) -> bool:
+    # bool("false") is True, so handle the string spellings explicitly.
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
+
+
+def _coerce_settings(data: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Coerce typed settings; return (data, keys that could not be coerced).
+
+    Invalid numbers must be rejected rather than stored as strings: the
+    pipeline int()/float()s these on every frame, so one bad value would
+    make every camera fail and reconnect in a loop.
+    """
+    bad: list[str] = []
+    for keys, conv in ((_INT_KEYS, lambda v: int(float(v))), (_FLOAT_KEYS, float)):
+        for k in keys:
+            if k in data and data[k] is not None:
+                try:
+                    data[k] = conv(data[k])
+                except (TypeError, ValueError):
+                    bad.append(k)
     for k in _BOOL_KEYS:
         if k in data:
-            data[k] = bool(data[k])
-    return data
+            data[k] = _to_bool(data[k])
+    return data, bad
+
+
+def _int_arg(value: Any, default: int, lo: int, hi: int) -> int:
+    try:
+        return min(hi, max(lo, int(value)))
+    except (TypeError, ValueError):
+        return default
 
 
 # ---- factory --------------------------------------------------------------
@@ -100,6 +115,7 @@ def create_app(*, db_path: str = "homeshield.db",
     )
 
     user_store = UserStore(db_path)
+    app.extensions["homeshield_users"] = user_store
 
     settings = SettingsStore(db_path)
     bus = EventBus(db_path=db_path, snapshot_dir=snap_path)
@@ -268,7 +284,12 @@ def create_app(*, db_path: str = "homeshield.db",
     @app.route("/api/status")
     @require_login
     def api_status():
-        return jsonify(manager.status())
+        out = manager.status()
+        s = settings.all()
+        out['fall_enabled'] = bool(s.get('fall_enabled', True))
+        out['fire_enabled'] = bool(s.get('fire_enabled', True))
+        out['face_enabled'] = bool(s.get('face_enabled', True))
+        return jsonify(out)
 
     @app.route("/api/system/start", methods=["POST"])
     @require_admin
@@ -293,6 +314,8 @@ def create_app(*, db_path: str = "homeshield.db",
                 "fire_loaded": models.fire_model is not None,
                 "face_available": bool(models.face_engine
                                        and models.face_engine.available),
+                "face_device": (models.face_engine.device
+                                if models.face_engine else "none"),
                 "device": models.device,
             },
         })
@@ -390,7 +413,7 @@ def create_app(*, db_path: str = "homeshield.db",
     @app.route("/api/events")
     @require_login
     def api_events():
-        limit = int(request.args.get("limit", 50))
+        limit = _int_arg(request.args.get("limit"), 50, 1, 1000)
         etype = request.args.get("type") or None
         return jsonify(bus.list(limit=limit, event_type=etype))
 
@@ -431,9 +454,12 @@ def create_app(*, db_path: str = "homeshield.db",
     @require_admin
     def api_zones_add():
         data = request.get_json(silent=True) or {}
+        cam_id = _int_arg(data.get("camera_id"), -1, 0, 2**31 - 1)
+        if cam_id < 0:
+            return jsonify({"error": "camera_id must be an integer"}), 400
         zid = zone_store.add(
             zone_name=str(data.get("zone_name", "Zone")),
-            camera_id=int(data.get("camera_id", 0)),
+            camera_id=cam_id,
             polygon=list(data.get("polygon") or []),
             zone_type=str(data.get("zone_type", "danger")),
         )
@@ -470,7 +496,8 @@ def create_app(*, db_path: str = "homeshield.db",
                                      "Install insightface + onnxruntime."}), 400
         if cid is None:
             return jsonify({"error": "Select a camera"}), 400
-        latest = manager.latest(int(cid))
+        cam_id = _int_arg(cid, -1, 0, 2**31 - 1)
+        latest = manager.latest(cam_id) if cam_id >= 0 else None
         if latest is None:
             return jsonify({"error": "Camera not running"}), 400
         frame = latest.raw()
@@ -576,7 +603,9 @@ def create_app(*, db_path: str = "homeshield.db",
     @app.route("/api/settings", methods=["POST"])
     @require_admin
     def api_settings_post():
-        data = _coerce_settings(request.get_json(silent=True) or {})
+        data, bad = _coerce_settings(request.get_json(silent=True) or {})
+        if bad:
+            return jsonify({"error": "invalid value for: " + ", ".join(bad)}), 400
         out = settings.update(data)
         manager.reload_settings()
         return jsonify(out)
