@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -64,10 +65,39 @@ def parse_result(r0) -> list[dict[str, Any]]:
     return fires
 
 
-def predict(model, frame, *, conf: float, imgsz: int, device) -> list[dict[str, Any]]:
+def predict(model, frame, *, conf: float, imgsz: int, device,
+            half: bool = False) -> list[dict[str, Any]]:
     """Run the fire model on one BGR frame. Not thread-safe: callers serialize."""
-    fr = model.predict(frame, conf=conf, imgsz=imgsz, device=device, verbose=False)
+    fr = model.predict(frame, conf=conf, imgsz=imgsz, device=device,
+                       half=half, verbose=False)
     return parse_result(fr[0]) if fr else []
+
+
+class FireConfirmer:
+    """Temporal confirmation: a class counts as present only once it has been
+    detected in at least `k` of the last `n` fire inference runs.
+
+    Single-frame detections on lamps, sunsets, orange clothing or screens are
+    the main source of fire false alarms; real fire and smoke persist.
+    """
+
+    def __init__(self) -> None:
+        self._hist: dict[str, deque] = {}
+
+    def update(self, present: set[str], k: int, n: int) -> set[str]:
+        n = max(1, int(n))
+        k = min(max(1, int(k)), n)
+        for cls in set(self._hist) | set(present):
+            h = self._hist.get(cls)
+            if h is None or h.maxlen != n:
+                h = self._hist[cls] = deque(h or (), maxlen=n)
+            h.append(cls in present)
+            if not any(h):
+                del self._hist[cls]
+        return {cls for cls, h in self._hist.items() if sum(h) >= k}
+
+    def reset(self) -> None:
+        self._hist.clear()
 
 
 # ---- CLI ------------------------------------------------------------------

@@ -10,10 +10,13 @@ If InsightFace isn't installed the module still imports cleanly and
 
 from __future__ import annotations
 
+import logging
 import threading
 from typing import Any, Optional
 
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 
 def _try_import_face_analysis():
@@ -21,7 +24,7 @@ def _try_import_face_analysis():
         from insightface.app import FaceAnalysis  # type: ignore
         return FaceAnalysis
     except Exception as e:
-        print(f"[face] insightface not loadable: {e}")
+        log.warning("insightface not loadable: %s", e)
         return None
 
 
@@ -72,11 +75,11 @@ class FaceEngine:
                 self._app = app
                 self.available = True
                 self.last_error = None
-                print(f"[face] FaceAnalysis ready ({providers}, {det_size})")
+                log.info("FaceAnalysis ready (%s, %s)", providers, det_size)
                 return True
             except Exception as e:
                 self.last_error = f"{type(e).__name__}: {e}"
-                print(f"[face] FaceAnalysis init failed (gpu={gpu}): {e}")
+                log.warning("FaceAnalysis init failed (gpu=%s): %s", gpu, e)
         return False
 
     # ---- public API -----------------------------------------------------
@@ -119,6 +122,19 @@ def _face_obj_to_dict(face) -> dict[str, Any]:
         "det_score": float(getattr(face, "det_score", 0.0)),
         "embedding": emb,
     }
+
+
+def is_good_face(face: dict[str, Any], *, min_size: float = 40.0,
+                 min_det_score: float = 0.6) -> bool:
+    """True when a face is large and confident enough to trust its embedding.
+
+    ArcFace embeddings from tiny, blurred or profile faces land far from the
+    person's enrolled embedding, so matching them produces false "unknown"
+    results (spurious intruder alerts) rather than real ones.
+    """
+    return (face.get("embedding") is not None
+            and float(face.get("det_score", 0.0)) >= min_det_score
+            and min(float(face.get("w", 0.0)), float(face.get("h", 0.0))) >= min_size)
 
 
 def _unit(v: np.ndarray) -> np.ndarray:

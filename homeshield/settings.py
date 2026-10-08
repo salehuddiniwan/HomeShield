@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from typing import Any
 
 from .db import read_conn, write_conn
+
+log = logging.getLogger(__name__)
 
 
 DEFAULTS: dict[str, Any] = {
@@ -31,12 +34,17 @@ DEFAULTS: dict[str, Any] = {
     "fire_cooldown": 5,
     "fire_classes": "fire,smoke",
     "fire_every_n": 2,
+    "fire_confirm_frames": 3,    # alert when seen in >= 3 ...
+    "fire_confirm_window": 5,    # ... of the last 5 fire inference runs
 
     # Face recognition
     "face_enabled": True,
     "face_match_threshold": 0.45,
     "intruder_cooldown": 30,
     "face_every_n": 5,
+    "face_min_size": 40,             # px; smaller faces are not matched
+    "face_min_det_score": 0.6,       # detector confidence needed to match
+    "intruder_confirm_frames": 2,    # consecutive face cycles before alerting
 }
 
 
@@ -74,7 +82,7 @@ class SettingsStore:
         if self._cache.get("process_fps") == 15:
             patches["process_fps"] = 0
         if patches:
-            print(f"[settings] migrating: {patches}")
+            log.info("migrating: %s", patches)
             self.update(patches)
 
     def _write_many(self, items: dict[str, Any]) -> None:

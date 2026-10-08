@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import json
 import os
 import queue
@@ -19,6 +20,7 @@ from .auth import (ROLE_ADMIN, ROLE_GUEST, UserStore, login_session,
                    session_must_change, session_role, session_user_id)
 from .cameras import CameraManager
 from .db import init_db, write_conn
+from .detectors.face import is_good_face
 from .events import Event, EventBus
 from .paths import ICON_DIR
 from .persons import IntruderStore, PersonStore
@@ -26,14 +28,17 @@ from .pipeline import Models, list_fire_models, list_pose_models
 from .settings import SettingsStore
 from .zones import ZoneStore
 
+log = logging.getLogger(__name__)
+
 
 # ---- settings POST coercion ----------------------------------------------
 
 _INT_KEYS = ("inactivity_seconds", "alert_cooldown", "yolo_imgsz",
              "process_fps", "fire_cooldown", "intruder_cooldown",
-             "fire_every_n", "face_every_n")
+             "fire_every_n", "face_every_n", "fire_confirm_frames",
+             "fire_confirm_window", "face_min_size", "intruder_confirm_frames")
 _FLOAT_KEYS = ("fall_threshold", "yolo_confidence", "fire_confidence",
-               "face_match_threshold")
+               "face_match_threshold", "face_min_det_score")
 _BOOL_KEYS = ("use_fp16", "fall_enabled", "fire_enabled", "face_enabled")
 
 
@@ -83,8 +88,8 @@ def create_app(*, db_path: str = "homeshield.db",
     secret = os.environ.get("HOMESHIELD_SECRET")
     if not secret:
         secret = secrets.token_hex(32)
-        print("[server] HOMESHIELD_SECRET not set; using an ephemeral key "
-              "(sessions will not survive a restart)")
+        log.warning("HOMESHIELD_SECRET not set; using an ephemeral key "
+                    "(sessions will not survive a restart)")
     app.secret_key = secret
     app.config.update(
         SESSION_COOKIE_HTTPONLY=True,
@@ -112,7 +117,7 @@ def create_app(*, db_path: str = "homeshield.db",
         try:
             manager.start()
         except Exception as e:
-            print(f"[server] auto-start failed: {e}")
+            log.exception("auto-start failed: %s", e)
 
     # ===== Pages =========================================================
 
@@ -474,6 +479,11 @@ def create_app(*, db_path: str = "homeshield.db",
         face = models.face_engine.best_face(frame)
         if not face or face.get("embedding") is None:
             return jsonify({"error": "No face found in frame"}), 400
+        if not is_good_face(face,
+                            min_size=float(settings.get("face_min_size", 40)),
+                            min_det_score=float(settings.get("face_min_det_score", 0.6))):
+            return jsonify({"error": "Face too small or unclear - move closer to "
+                                     "the camera and face it directly"}), 400
         info = person_store.add(
             name=name, category=category,
             embedding=face["embedding"],

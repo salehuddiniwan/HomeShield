@@ -12,6 +12,7 @@ COLOR_FIRE = (40, 60, 230)
 COLOR_SMOKE = (200, 200, 200)
 COLOR_FACE_OK = (80, 220, 130)
 COLOR_FACE_BAD = (60, 60, 240)
+COLOR_FACE_UNSURE = (150, 150, 150)
 COLOR_BANNER_OK = (40, 130, 50)
 COLOR_BANNER_CRIT = (50, 50, 230)
 COLOR_DANGER_FILL = (50, 50, 230, 80)
@@ -98,9 +99,10 @@ def _draw_persons(frame, persons, kp_conf_min):
                 pass
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         pid = p.get("id", "?")
+        who = f"#{pid} {p['name']}" if p.get("name") else f"#{pid}"
         state_label = det.state.value if det is not None else "?"
-        text = (f"#{pid} !! FALL !!" if det is not None and det.fall_alert
-                else f"#{pid} {state_label}")
+        text = (f"{who} !! FALL !!" if det is not None and det.fall_alert
+                else f"{who} {state_label}")
         _label(frame, text, x1, max(y1 - 2, 14),
                fg=COLOR_TEXT_DARK, bg=color, size=0.5, thick=1)
 
@@ -109,14 +111,17 @@ def _draw_faces(frame, faces):
     for f in faces:
         x, y, w, h = int(f["x"]), int(f["y"]), int(f["w"]), int(f["h"])
         is_known = f.get("match_id") is not None
-        color = COLOR_FACE_OK if is_known else COLOR_FACE_BAD
-        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
         if is_known:
+            color = COLOR_FACE_OK
             name = f.get("match_name") or "Unknown"
             score = f.get("match_score", 0.0)
             text = f"{name} ({score:.2f})" if score > 0 else name
+        elif f.get("quality_ok", True):
+            color, text = COLOR_FACE_BAD, "INTRUDER"
         else:
-            text = "INTRUDER"
+            # Too small / blurry to identify: neither known nor an intruder.
+            color, text = COLOR_FACE_UNSURE, "?"
+        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
         _label(frame, text, x, max(y - 2, 14),
                fg=COLOR_TEXT_LIGHT, bg=color, size=0.45, thick=1)
 
