@@ -9,6 +9,7 @@ internal queue. A daemon thread does the snapshot + DB + SSE fan-out.
 
 from __future__ import annotations
 
+import logging
 import json
 import queue
 import threading
@@ -22,6 +23,8 @@ import cv2
 import numpy as np
 
 from .db import read_conn, write_conn
+
+log = logging.getLogger(__name__)
 
 
 EVENT_TYPES = {
@@ -130,12 +133,12 @@ def save_snapshot(frame: np.ndarray, snapshot_dir: Path, ev: Event,
                 _draw_event_box(out, ev.bbox, color, label,
                                 float(ev.confidence or 0))
             except Exception as e:
-                print(f"[events] snapshot annotate failed: {e}")
+                log.warning("snapshot annotate failed: %s", e)
         cv2.imwrite(str(snapshot_dir / name), out,
                     [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
         return name
     except Exception as e:
-        print(f"[events] snapshot failed: {e}")
+        log.warning("snapshot failed: %s", e)
         return None
 
 
@@ -202,8 +205,8 @@ class EventBus:
         except queue.Full:
             self._pub_dropped += 1
             if self._pub_dropped <= 5 or self._pub_dropped % 50 == 0:
-                print(f"[events] publish queue full, dropping "
-                      f"{ev.event_type} (dropped: {self._pub_dropped})")
+                log.warning("publish queue full, dropping %s (dropped: %d)",
+                            ev.event_type, self._pub_dropped)
         return ev
 
     def _publisher_loop(self) -> None:
@@ -215,7 +218,7 @@ class EventBus:
             try:
                 self._do_publish(ev, frame)
             except Exception as e:
-                print(f"[events] publisher error: {e}")
+                log.exception("publisher error: %s", e)
 
     def _do_publish(self, ev: Event, frame: Optional[np.ndarray]) -> None:
         if (frame is not None and self.snapshot_dir is not None

@@ -11,6 +11,7 @@ forced to pick a real password before reaching the dashboard.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 from functools import wraps
@@ -20,6 +21,8 @@ from flask import jsonify, session
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from .db import read_conn, write_conn
+
+log = logging.getLogger(__name__)
 
 
 ROLE_ADMIN = "admin"
@@ -52,9 +55,9 @@ class UserStore:
                 role=ROLE_ADMIN,
                 must_change=True,
             )
-            print(f"[auth] seeded default admin "
-                  f"({DEFAULT_ADMIN_USERNAME}/{DEFAULT_ADMIN_PASSWORD}) - "
-                  f"you will be forced to set a new password on first login")
+            log.warning("seeded default admin (%s/%s) - you will be forced to set a "
+                        "new password on first login",
+                        DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD)
 
     # ---- CRUD -----------------------------------------------------------
 

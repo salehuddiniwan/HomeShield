@@ -17,6 +17,7 @@ python run_homeshield.py --host 127.0.0.1
 from __future__ import annotations
 
 import argparse
+import logging
 import socket
 from pathlib import Path
 
@@ -51,6 +52,15 @@ def main():
                    help="Don't auto-start cameras on boot (useful for debugging)")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format="%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    # Per-request access logs and third-party chatter stay quiet unless --debug.
+    for noisy in ("werkzeug", "PIL", "matplotlib"):
+        logging.getLogger(noisy).setLevel(logging.DEBUG if args.debug else logging.WARNING)
 
     app = create_app(
         db_path=args.db,
