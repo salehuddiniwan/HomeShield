@@ -266,7 +266,7 @@ Source: C:/path/to/sample_fall.mp4
 Source: ./test_videos/kitchen_fire.mp4
 ```
 
-The pipeline loops the file by default, so you can leave it running while tuning thresholds.
+The pipeline loops the file and plays it at its real frame rate. Detection timing uses the video's own clock, so results match what a live camera would produce even if your GPU processes the file slower than real time.
 
 ---
 
@@ -304,18 +304,26 @@ When an unknown face appears, an entry pops into **Persons → Intruders** with 
 
 ## ⚙️ Tuning for your hardware
 
-All knobs live in **Settings** and apply live without restarting cameras (only swapping the `.pt` model file forces a model reload).
+All knobs live in **Settings** and apply live without restarting cameras. Changing the pose / fire model file or the FP16 switch reloads that model automatically.
 
 | Setting | Effect | When to adjust |
 |---|---|---|
 | **Pose model** | Smaller (`yolo11n-pose`) = faster, less accurate. `yolo26x-pose` = slowest, best accuracy. | Drop to `n` on CPU or low-end GPU. |
 | **imgsz** | Inference resolution (320 / 416 / 640). | Lower for more FPS, higher for far-away subjects. |
 | **Target FPS cap** | Caps the capture loop. | Set to 10–15 on CPU. |
-| **FP16 (half-precision)** | Halves GPU memory and boosts throughput on supported NVIDIA cards. | Leave **on** for RTX cards; **off** for very old GPUs / CPU. |
+| **FP16 (half-precision)** | Halves model memory on NVIDIA GPUs. At one frame per call the speed gain is small (~3% for `yolo11x-pose` on an RTX 4070); detections are unchanged (keypoints within 0.1 px of FP32). | Leave **on**; it is ignored on CPU. |
 | **Frame skipping** | Pose runs every frame; fire every 2nd; face every 5th. | Bump face skip if face inference is the bottleneck. |
 | **Fire / Face enabled** | Toggle the heavier detectors. | Disable face on CPU-only setups. |
 | **Sensitivity (fall)** | Adjusts the FSM thresholds for descent velocity and lying duration. | Raise if false-falls are common; lower if real falls are missed. |
 | **Cooldowns** | Min seconds between repeat alerts of the same class. | Raise for noisy environments. |
+
+Advanced settings (not in the UI yet; set them with `POST /api/settings`):
+
+| Key | Default | Effect |
+|---|---|---|
+| `fire_confirm_frames` / `fire_confirm_window` | 3 / 5 | Fire or smoke must be detected in 3 of the last 5 fire checks before alerting. Rejects one-frame false positives (lamps, sunsets, orange clothing). |
+| `face_min_size` / `face_min_det_score` | 40 px / 0.6 | Faces smaller or less certain than this are shown as `?` and never matched, so they cannot raise intruder alerts. Also applied when enrolling a person. |
+| `intruder_confirm_frames` | 2 | An unknown face must appear in this many consecutive face checks before the intruder alert. |
 
 ---
 
@@ -325,14 +333,25 @@ HomeShield is a single Flask process that runs one **CameraManager** with one wo
 
 ![HomeShield Component Diagram](UML_Diagrams/PNG/Component%20Diagram.png)
 
-The matching PlantUML source lives in [`UML_Diagrams/pump/02_component_diagram.puml`](UML_Diagrams/pump/02_component_diagram.puml), and additional UML views (use case, class, object, activity, sequence, deployment, and the three FSM diagrams) are in [`UML_Diagrams/PNG/`](UML_Diagrams/PNG/).
+The matching PlantUML source lives in [`UML_Diagrams/puml/02_component_diagram.puml`](UML_Diagrams/puml/02_component_diagram.puml), and additional UML views (use case, class, object, activity, sequence, deployment, and the three FSM diagrams) are in [`UML_Diagrams/PNG/`](UML_Diagrams/PNG/).
 
 Key design choices:
 - **Per-camera worker threads** share one set of YOLO / ONNX models on the GPU. Adding a camera does not duplicate VRAM.
+- **Per-camera tracking** — each camera keeps its own ByteTrack state even though the pose model is shared, so one camera's frames never update or expire another camera's person IDs.
+- **Newest-frame capture** — live cameras are read on a separate grabber thread and the pipeline always takes the newest frame, so a slow GPU never makes the feed (and the alerts) drift behind real time. Video files are instead processed frame by frame and timed by the file's own clock.
 - **Frame skipping**: pose runs every frame to keep the FSM responsive; fire runs every 2nd frame; face every 5th.
-- **Async face inference** — face detection runs on its own daemon thread per camera so the capture loop runs at pose-only speed regardless of how slow `app.get()` is.
-- **Non-blocking event publishing** offloads JPEG encoding and SQLite writes to a daemon thread, so the capture loop never waits on disk I/O.
-- **Hot reloading** — toggling `fire_enabled` / `face_enabled` or tweaking imgsz / FPS / thresholds applies live without restarting cameras.
+- **Async face inference** — face detection runs on its own daemon thread per camera so the capture loop runs at pose-only speed regardless of how slow `app.get()` is. A recognised face is attached to the tracked person, so fall events name the person and child danger-zone alerts work.
+- **Lazy stream encoding** — a frame is JPEG-encoded only when someone is watching that camera, on the viewer's thread.
+- **Non-blocking event publishing** offloads snapshot encoding and SQLite writes to a daemon thread, so the capture loop never waits on disk I/O.
+- **Hot reloading** — toggling `fire_enabled` / `face_enabled`, switching model files or tweaking imgsz / FPS / thresholds applies live without restarting cameras.
+
+### Tests
+
+```bash
+python -m pytest
+```
+
+The suite runs in a few seconds without a GPU or model weights. It covers the fall FSM on synthetic skeleton tracks (falls vs. sitting, bending and lying down slowly, at 3–30 FPS), per-camera tracker isolation, fire and intruder confirmation, zones, face matching and the frame grabber.
 
 ---
 
@@ -394,6 +413,7 @@ FYP/
 │   └── templates/
 │       └── index.html              #   single-page dashboard UI
 │
+├── tests/                          # pytest suite (+ synthetic skeleton tracks)
 ├── run_homeshield.py               # Entry point (argparse + create_app)
 ├── pyproject.toml                  # Package metadata + pinned, ABI-consistent deps
 ├── requirements.txt                # Installs the package (-e .[plot])
