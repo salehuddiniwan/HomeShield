@@ -1,8 +1,13 @@
-"""Two-stage fall detector + 7-state FSM, one instance per tracked person."""
+"""Two-stage fall detector + 7-state FSM, one instance per tracked person.
+
+All timing uses the `now` timestamps passed to `step()` (never the wall
+clock), so the FSM behaves the same on a live camera, on a video file
+processed faster or slower than real time, and in tests.
+"""
 
 from __future__ import annotations
 
-import time
+import logging
 from collections import deque
 from enum import Enum
 from typing import Optional
@@ -11,6 +16,8 @@ import numpy as np
 
 from .config import Config
 from .features import FeatureExtractor
+
+log = logging.getLogger(__name__)
 
 
 class State(Enum):
@@ -27,12 +34,16 @@ class State(Enum):
 class FallDetector:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        max_buf_s = max(cfg.impact_recent_s, cfg.height_ref_window_s,
-                        cfg.short_window_s, cfg.sustain_s) + 1.0
-        self.history = deque(maxlen=int(cfg.fps_assumed * max_buf_s) + 5)
+        # History is pruned by age, not by count, so every window below covers
+        # the same span of time whatever the frame rate. The inactivity window
+        # is capped so a long inactivity_s doesn't make each step O(minutes).
+        self.history_s = max(cfg.impact_recent_s, cfg.height_ref_window_s,
+                             cfg.short_window_s, cfg.sustain_s, 2.0,
+                             min(cfg.inactivity_s, 10.0)) + 1.0
+        self.history: deque = deque()   # (timestamp, FrameFeatures)
         self.state = State.STANDING
-        self.entered_at = time.time()
-        self.last_motion_at = time.time()
+        self.entered_at: Optional[float] = None      # set on first step()
+        self.last_motion_at: Optional[float] = None
         self.last_impact_at = None
         self.fall_alert = False
 
@@ -49,7 +60,10 @@ class FallDetector:
     def _stage_b_sustained(self, now):
         cutoff = now - self.cfg.sustain_s
         rel = [(t, f) for t, f in self.history if t >= cutoff and f.has_person]
-        if len(rel) < 3:
+        # Require the samples to span half the window rather than a fixed
+        # sample count: 3 samples in 0.5 s is unreachable below ~5 FPS, which
+        # silently disabled fall detection on slow / multi-camera setups.
+        if len(rel) < 2 or (rel[-1][0] - rel[0][0]) < 0.5 * self.cfg.sustain_s:
             return False
         return all((f.is_horizontal and f.is_low) for _, f in rel)
 
@@ -60,18 +74,23 @@ class FallDetector:
             return 0.0
         return sum(1 for f in rel if getattr(f, attr)) / len(rel)
 
-    def _enter(self, new):
+    def _enter(self, new, now):
         if new != self.state:
-            print(f"[FSM] {self.state.value}  ->  {new.value}")
+            log.debug("[FSM] %s  ->  %s", self.state.value, new.value)
             self.state = new
-            self.entered_at = time.time()
+            self.entered_at = now
             if new == State.FALL_DETECTED:
                 self.fall_alert = True
             elif new == State.STANDING:
                 self.fall_alert = False
 
     def step(self, f, now):
+        if self.entered_at is None:
+            self.entered_at = self.last_motion_at = now
         self.history.append((now, f))
+        cutoff = now - self.history_s
+        while self.history and self.history[0][0] < cutoff:
+            self.history.popleft()
         if not f.has_person:
             return
         if not f.is_still:
@@ -87,67 +106,67 @@ class FallDetector:
 
         if s in (State.STANDING, State.WALKING, State.SITTING):
             if impact_recent and stage_b:
-                self._enter(State.FALL_DETECTED)
+                self._enter(State.FALL_DETECTED, now)
                 return
             if s == State.STANDING:
                 if (f.trunk_angle < cfg.upright_angle_max
                         and f.aspect_ratio < cfg.standing_aspect_max
                         and f.motion_energy_bu_s > cfg.walking_motion_min):
-                    self._enter(State.WALKING)
+                    self._enter(State.WALKING, now)
                 elif (f.trunk_angle < cfg.horizontal_angle_min
                       and f.aspect_ratio > cfg.sitting_aspect_min
                       and not stage_b):
-                    self._enter(State.SITTING)
+                    self._enter(State.SITTING, now)
             elif s == State.WALKING:
                 if (f.aspect_ratio > cfg.sitting_aspect_min
                         and f.motion_energy_bu_s < cfg.walking_motion_min
                         and not stage_b):
-                    self._enter(State.SITTING)
+                    self._enter(State.SITTING, now)
                 elif (f.aspect_ratio < cfg.standing_aspect_max
                       and f.motion_energy_bu_s < cfg.walking_motion_min):
-                    self._enter(State.STANDING)
+                    self._enter(State.STANDING, now)
             elif s == State.SITTING:
                 if (f.trunk_angle < cfg.upright_angle_max
                         and f.aspect_ratio < cfg.standing_aspect_max):
-                    self._enter(State.STANDING)
+                    self._enter(State.STANDING, now)
                 elif ((now - self.last_motion_at) > cfg.inactivity_s
                       and self._ratio_in(now, cfg.inactivity_s, "is_still") > 0.7):
-                    self._enter(State.INACTIVITY)
+                    self._enter(State.INACTIVITY, now)
             return
 
         if s == State.FALL_DETECTED:
             time_in = now - self.entered_at
             if stage_b and time_in <= 5.0:
-                self._enter(State.LYING_AFTER_FALL)
+                self._enter(State.LYING_AFTER_FALL, now)
             elif stage_b and time_in > 5.0:
-                self._enter(State.LYING_MOTIONLESS)
+                self._enter(State.LYING_MOTIONLESS, now)
             elif (self._ratio_in(now, 1.0, "is_upright") > 0.6
                   and not f.is_horizontal):
-                self._enter(State.STANDING)
+                self._enter(State.STANDING, now)
             return
 
         if s == State.LYING_AFTER_FALL:
             time_in = now - self.entered_at
             if (time_in > cfg.lying_motionless_s
                     and self._ratio_in(now, 2.0, "is_still") > 0.7):
-                self._enter(State.LYING_MOTIONLESS)
+                self._enter(State.LYING_MOTIONLESS, now)
             elif (self._ratio_in(now, 1.0, "is_upright") > 0.6
                   and not f.is_horizontal):
-                self._enter(State.STANDING)
+                self._enter(State.STANDING, now)
             return
 
         if s == State.LYING_MOTIONLESS:
             if (self._ratio_in(now, 1.0, "is_upright") > 0.6
                     and not f.is_horizontal):
-                self._enter(State.STANDING)
+                self._enter(State.STANDING, now)
             return
 
         if s == State.INACTIVITY:
             if impact_recent and stage_b:
-                self._enter(State.FALL_DETECTED)
+                self._enter(State.FALL_DETECTED, now)
             elif (self._ratio_in(now, 1.0, "is_upright") > 0.6
                   and not f.is_horizontal):
-                self._enter(State.STANDING)
+                self._enter(State.STANDING, now)
 
 
 # ---- Multi-person state manager ------------------------------------------

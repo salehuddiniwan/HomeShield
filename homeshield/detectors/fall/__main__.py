@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import time
 from pathlib import Path
 
@@ -61,20 +62,26 @@ def run(cfg, source):
         writer = cv2.VideoWriter(cfg.save_path, fourcc, src_fps, (width, height))
         print(f"[save] writing -> {cfg.save_path}")
 
+    # Video files are timed by their own frame clock, so velocities and
+    # durations stay correct however fast or slow inference runs.
+    is_file = isinstance(source, str) and Path(source).is_file()
     state = MultiPersonState(cfg)
     smoothed_fps = float(src_fps)
     last_t = time.time()
+    frame_idx = 0
     while True:
         ok, frame = cap.read()
         if not ok:
             break
+        frame_idx += 1
         # model.track() runs detection + persistent ID assignment via ByteTrack
         results = model.track(frame, imgsz=cfg.imgsz, conf=cfg.conf,
                               persist=True, tracker=cfg.tracker,
-                              verbose=False,
+                              verbose=False, half=device != "cpu",
                               device=0 if device == "0" else device)
         result = results[0]
-        now = time.time()
+        wall = time.time()
+        now = frame_idx / cfg.fps_assumed if is_file else wall
         persons = state.step(result, frame.shape[0], frame.shape[1], now)
 
         # Per-person drawing (capped so a crowded scene doesn't spam the screen)
@@ -86,13 +93,13 @@ def run(cfg, source):
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             draw_person_label(frame, person)
 
-        dt = max(1e-6, now - last_t)
-        last_t = now
+        dt = max(1e-6, wall - last_t)
+        last_t = wall
         smoothed_fps = 0.9 * smoothed_fps + 0.1 * (1.0 / dt)
 
         if cfg.draw_hud:
             primary = state.primary_person(persons)
-            draw_hud(frame, state, primary, smoothed_fps)
+            draw_hud(frame, state, primary, smoothed_fps, now)
 
         if writer is not None:
             writer.write(frame)
@@ -146,5 +153,7 @@ def parse_args():
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logging.getLogger("homeshield.detectors.fall.fsm").setLevel(logging.DEBUG)
     cfg, src = parse_args()
     run(cfg, src)

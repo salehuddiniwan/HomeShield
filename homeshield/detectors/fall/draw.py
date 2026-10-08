@@ -49,7 +49,7 @@ def draw_person_label(frame, person):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (20, 20, 20), 1, cv2.LINE_AA)
 
 
-def draw_hud(frame, state: MultiPersonState, primary, fps):
+def draw_hud(frame, state: MultiPersonState, primary, fps, now=None):
     """Top banner = global alert; side panel = primary (largest) person metrics."""
     h, w = frame.shape[:2]
     n_tracked = len(state.detectors)
@@ -78,7 +78,7 @@ def draw_hud(frame, state: MultiPersonState, primary, fps):
 
     f = primary["feats"]
     det = primary["detector"]
-    now = time.time()
+    now = time.time() if now is None else now
     impact_age = "-"
     if det.last_impact_at is not None:
         impact_age = f"{now - det.last_impact_at:4.1f}s ago"

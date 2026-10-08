@@ -17,6 +17,7 @@ class Config:
     kp_conf_min: float = 0.30
 
     kp_ema_alpha: float = 0.6
+    motion_window_s: float = 0.5        # baseline for motion energy (see features.py)
     fps_assumed: float = 30.0
     short_window_s: float = 0.5         # peak-velocity window
     impact_recent_s: float = 2.0        # how far back the peak still counts
@@ -28,7 +29,9 @@ class Config:
     # Spatial thresholds
     upright_angle_max: float = 30.0
     horizontal_angle_min: float = 60.0
-    walking_motion_min: float = 0.05    # body-units / s
+    # body-units / s (~15 cm/s). Keypoint jitter on a still person measures
+    # ~0.05-0.1 bu/s over motion_window_s; real walking is ~1.5-2.5 bu/s.
+    walking_motion_min: float = 0.3
     sitting_aspect_min: float = 1.0
     standing_aspect_max: float = 0.7
     horizontal_aspect: float = 1.3

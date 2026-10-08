@@ -60,6 +60,7 @@ class FeatureExtractor:
         self.prev_kpts_motion = None
         self.prev_t = None
         self.height_history = deque()  # (timestamp, h_px)
+        self.motion_ref = deque()      # (timestamp, smoothed kpts)
 
     def reset(self):
         self.smoothed_kpts = None
@@ -67,6 +68,7 @@ class FeatureExtractor:
         self.prev_kpts_motion = None
         self.prev_t = None
         self.height_history.clear()
+        self.motion_ref.clear()
 
     def _smooth(self, kpts):
         a = self.cfg.kp_ema_alpha
@@ -121,6 +123,32 @@ class FeatureExtractor:
             return None
         return kpts[ok, :2].mean(axis=0)
 
+    def _motion_energy(self, kpts, now, scale):
+        """Mean joint speed (body-units / s) relative to the pose about
+        `motion_window_s` ago.
+
+        Measuring frame-to-frame instead turns ~1 px of keypoint jitter into
+        ~0.6 bu/s at 30 FPS, far above motion_threshold_bu_s, so a person
+        lying perfectly still never counted as still (and standing people
+        flickered into Walking). Jitter does not accumulate over the window;
+        real movement does.
+        """
+        self.motion_ref.append((now, kpts.copy()))
+        cutoff = now - self.cfg.motion_window_s
+        while len(self.motion_ref) > 1 and self.motion_ref[1][0] <= cutoff:
+            self.motion_ref.popleft()
+        ref_t, ref = self.motion_ref[0]
+        # Until the baseline spans half the window (first ~0.25 s of a track)
+        # the estimate would still be frame-to-frame noise.
+        if now - ref_t < 0.5 * self.cfg.motion_window_s or ref.shape != kpts.shape:
+            return 0.0
+        both = ((kpts[:, 2] >= self.cfg.kp_conf_min) &
+                (ref[:, 2] >= self.cfg.kp_conf_min))
+        if not both.any():
+            return 0.0
+        d = kpts[both, :2] - ref[both, :2]
+        return float(np.linalg.norm(d, axis=1).mean() / scale / (now - ref_t))
+
     def _height_ref(self, now, h_px):
         self.height_history.append((now, h_px))
         cutoff = now - self.cfg.height_ref_window_s
@@ -152,20 +180,20 @@ class FeatureExtractor:
         c = self._centroid(kpts)
         if c is not None:
             f.centroid_y_norm = float(c[1]) / float(frame_h)
-            if self.prev_centroid is not None and self.prev_t is not None:
-                dt = max(1e-3, now - self.prev_t)
-                dy_px = float(c[1] - self.prev_centroid[1])
-                f.centroid_velocity_bu_s = (dy_px / scale) / dt
             self.prev_centroid = c
         if (self.prev_kpts_motion is not None and self.prev_t is not None
                 and self.prev_kpts_motion.shape == kpts.shape):
             both = ((kpts[:, 2] >= self.cfg.kp_conf_min) &
                     (self.prev_kpts_motion[:, 2] >= self.cfg.kp_conf_min))
-            if both.any():
-                d = kpts[both, :2] - self.prev_kpts_motion[both, :2]
-                dt = max(1e-3, now - (self.prev_t - 1e-3))
-                f.motion_energy_bu_s = float(
-                    np.linalg.norm(d, axis=1).mean() / scale / dt)
+            if both.sum() >= 4:
+                # Centroid descent over joints visible in BOTH frames. Using the
+                # centroid of whichever joints are visible makes a single joint
+                # flickering below kp_conf_min look like a sudden drop of the
+                # whole body, i.e. a fake Stage-A impact.
+                dy = kpts[both, 1] - self.prev_kpts_motion[both, 1]
+                dt = max(1e-3, now - self.prev_t)
+                f.centroid_velocity_bu_s = float(dy.mean()) / scale / dt
+        f.motion_energy_bu_s = self._motion_energy(kpts, now, scale)
         self.prev_kpts_motion = kpts.copy()
         self.prev_t = now
         f.is_horizontal = (f.trunk_angle > self.cfg.horizontal_angle_min
