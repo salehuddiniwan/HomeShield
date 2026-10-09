@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="300" height="72" viewBox="0 0 300 72" role="img" aria-label="HomeShield"><title>HomeShield</title>
+  <g transform="translate(4 4)">
+  <path d="M32 3 55 11v18c0 15.5-9.8 26.6-23 32C18.8 55.6 9 44.5 9 29V11Z" fill="#f5a200"/>
+  <path d="M32 19.5 46.5 31v17h-29V31Z" fill="#16213e" stroke="#16213e" stroke-width="2.5" stroke-linejoin="round"/>
+  <circle cx="32" cy="38.5" r="6" fill="#f5a200"/>
+  <circle cx="32" cy="38.5" r="2.4" fill="#16213e"/>
+  <circle cx="33.4" cy="37.1" r=".9" fill="#f5a200"/>
+  </g>
+  <text x="80" y="46" font-family="'Chakra Petch', 'Rubik', 'Segoe UI', Arial, sans-serif" font-size="32" font-weight="700" letter-spacing=".5" fill="#f0f4ff">Home<tspan fill="#f5a200">Shield</tspan></text>
+</svg>
