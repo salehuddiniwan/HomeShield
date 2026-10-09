@@ -21,6 +21,7 @@ import logging
 import socket
 from pathlib import Path
 
+from homeshield.notify import load_dotenv
 from homeshield.server import create_app
 
 
@@ -61,6 +62,9 @@ def main():
     # Per-request access logs and third-party chatter stay quiet unless --debug.
     for noisy in ("werkzeug", "PIL", "matplotlib"):
         logging.getLogger(noisy).setLevel(logging.DEBUG if args.debug else logging.WARNING)
+
+    # Twilio credentials for WhatsApp alerts live in .env next to this file.
+    load_dotenv(Path(__file__).resolve().parent / ".env")
 
     app = create_app(
         db_path=args.db,

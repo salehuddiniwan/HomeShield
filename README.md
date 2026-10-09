@@ -19,6 +19,8 @@ Built as a Final-Year Project at the **International Islamic University Malaysia
 - **Registered persons** gallery — enrol family members from a still photo or a live capture.
 - **Auto-intruder logging** — anyone not in the gallery is snapshot-logged with timestamp and camera.
 - **Real-time alert stream** — Server-Sent Events push new events to the dashboard the instant they're published.
+- **Incidents, not a wall of rows** — detections are grouped into incidents (one camera, one kind of trouble, no gap over 2 minutes), each with its peak confidence and best snapshot. Anyone signed in can **acknowledge** an incident or mark it a **false alarm**, with an optional note; the record keeps who did it, and a 7-day false-alarm count per detector and camera builds up on the Events page.
+- **WhatsApp alerts (optional)** — one message through Twilio when an incident starts and one more if it escalates (e.g. a fall becomes "lying motionless"), never one per detection.
 - **Annotated snapshots** — every event is saved as a JPEG with the bounding box / pose skeleton / face label burned in.
 
 ### Zones
@@ -166,9 +168,19 @@ python -m pytest
 ```
 
 ### 6. Configure
-- Drop YOLO **pose weights** (`*-pose.pt`) into `Fall_Detection/weights/`. The dashboard's **Settings → Fall Detection** dropdown auto-populates from whatever's in that folder.
+- Drop YOLO **pose weights** (`*-pose.pt`) into `Fall_Detection/weights/`. The dashboard's **Settings → Fall detection** dropdown auto-populates from whatever's in that folder.
 - Make sure **Fire_Detection/best.pt** exists (the custom fire/smoke weights).
 - The first time you run the app, it creates `homeshield.db`, `snapshots/`, `person_photos/`, and `intruder_photos/` automatically.
+- *(Optional)* WhatsApp alerts: in **Settings → Notifications → Twilio account**, paste your **Account SID**, **Auth token** and **WhatsApp sender** number from the Twilio Console, add the phone numbers under **WhatsApp alerts**, save, and use **Send test message**. The auth token is write-only: it is stored in `homeshield.db` and never shown again (**Remove saved token** deletes it). The **WhatsApp sender** is Twilio's WhatsApp number (on a trial, the one shown on the Console's **Try out WhatsApp** page), not your own phone. Each receiving phone must be a verified tester and first send the join code from that page (e.g. `join twilio-trial`) to the sender number. Without these values, WhatsApp stays off and nothing leaves the machine.
+
+  **Twilio trial accounts only send Twilio's own message templates** (free text fails with "ContentSid Required"). Copy the template's `contentSid` (starts with `HX`) from the code sample on the Try out WhatsApp page into **Message template**. Trial templates have fixed wording, so the message tells you to check HomeShield rather than what happened. After upgrading Twilio you can get your own template approved, e.g. *"HomeShield: {{1}} on {{2}} at {{3}} (confidence {{4}})"*, and tick **My template has {{1}} to {{4}}** so alerts fill in what, where, when and how sure. Leave Message template empty to send HomeShield's own text (works on upgraded accounts within WhatsApp's 24-hour reply window).
+
+  You can also keep the details in a git-ignored `.env` file next to `run_homeshield.py` (values saved in Settings take priority):
+  ```
+  TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  TWILIO_AUTH_TOKEN=your_auth_token
+  TWILIO_WHATSAPP_FROM=+14155238886
+  ```
 
 ### 7. Run
 
@@ -294,13 +306,13 @@ The pipeline loops the file and plays it at its real frame rate. Detection timin
 
 ## 🎯 Using the system
 
-### Register your family members (before you turn on intruder detection)
-1. Go to **Persons → Add person**.
-2. Enter the person's name.
-3. Either upload a clear, well-lit photo **or** capture one from any active camera.
+### Register your family members
+1. Make sure face recognition is on (**Settings → Face recognition**); registering needs it.
+2. Go to **People → Register a person** and enter the person's name and category.
+3. Pick a camera, ask them to look straight at it, and press **Capture from camera** once the preview says **FACE OK**.
 4. Repeat for every household member.
 
-> ⚠️ **Important:** Do this *before* enabling face detection. Otherwise, every face — including yours — will be logged as an intruder until they're enrolled.
+> ⚠️ **Important:** Register everyone soon after turning face recognition on. Until then, household members show up under **People → Intruders seen**; you can register them straight from there.
 
 ### Set up zones
 1. Open **Zones**, pick a camera from the list.
@@ -312,15 +324,22 @@ The pipeline loops the file and plays it at its real frame rate. Detection timin
 
 ### Watch the live feed
 **Live feeds** is the main dashboard:
+- A one-line verdict at the top says **All clear** or how many incidents need attention (it says **Not monitoring** when the system is stopped, rather than claiming all is well).
 - Each camera shows the annotated MJPEG stream with bounding boxes, pose skeletons, and face labels overlaid.
-- The right-hand event log streams every detection in real time via Server-Sent Events.
-- Click any event to open its annotated snapshot.
+- The incident board lists open incidents first, then the ones recently handled, and updates in real time via Server-Sent Events.
+
+### Handle incidents
+Click (or tap) an incident to open it: the most confident snapshot, how long it lasted, how many detections it grouped, and a timeline of the first, peak, escalating and last detections.
+- **View live** jumps to that camera.
+- **Acknowledge** — you've seen it and dealt with it. **False alarm** — the detector was wrong. Either can carry a short note, and either can be changed later.
+- If a closed incident gets worse (a fall turns into "lying motionless"), it reopens marked **Escalated**.
+- **Incidents** shows every incident with status, type and camera filters, the 7-day false-alarm counts, and a **Detection log** view of the individual detections. **Clear history** (admins only) deletes incidents and the log.
 
 ### Handle intruders
-When an unknown face appears, an entry pops into **Persons → Intruders** with a snapshot and timestamp. From there you can:
-- **Enrol** them as a known person if they were a friend / relative.
-- **Delete** the entry if it was a false positive (poor lighting, motion blur, partial face).
-- **Export** the snapshot if you need to share it.
+When an unknown face appears, an entry pops into **People → Intruders seen** with a snapshot and timestamp. From there you can:
+- **Register** them (name and category) if it's someone you know.
+- **Dismiss** the entry if it was a false positive (poor lighting, motion blur, partial face).
+- **Delete** a dismissed entry and its photo for good (tick **Show dismissed** to see them).
 
 ---
 
@@ -365,6 +384,7 @@ Key design choices:
 - **Async face inference** — face detection runs on its own daemon thread per camera so the capture loop runs at pose-only speed regardless of how slow `app.get()` is. A recognised face is attached to the tracked person, so fall events name the person and child danger-zone alerts work.
 - **Lazy stream encoding** — a frame is JPEG-encoded only when someone is watching that camera, on the viewer's thread.
 - **Non-blocking event publishing** offloads snapshot encoding and SQLite writes to a daemon thread, so the capture loop never waits on disk I/O.
+- **Server-side incidents** — the publisher files each detection into its incident in the same SQLite transaction (`homeshield/incidents.py`), so every phone and laptop sees the same incidents and the same resolutions. Events logged by older versions are grouped once on upgrade.
 - **Hot reloading** — toggling `fire_enabled` / `face_enabled`, switching model files or tweaking imgsz / FPS / thresholds applies live without restarting cameras.
 
 ### Tests
@@ -373,7 +393,7 @@ Key design choices:
 python -m pytest
 ```
 
-Install it first with `pip install pytest`. The suite runs in a few seconds without a GPU or model weights. It covers the fall FSM on synthetic skeleton tracks (falls vs. sitting, bending and lying down slowly, at 3–30 FPS), per-camera tracker isolation, fire and intruder confirmation, zones, face matching and the frame grabber.
+Install it first with `pip install pytest`. The suite runs in a few seconds without a GPU or model weights. It covers the fall FSM on synthetic skeleton tracks (falls vs. sitting, bending and lying down slowly, at 3–30 FPS), per-camera tracker isolation, fire and intruder confirmation, zones, face matching, the frame grabber, incident grouping/escalation/resolution, per-incident WhatsApp, and API input validation.
 
 ---
 
@@ -398,15 +418,11 @@ FYP/
 │   ├── insightface-0.7.3-cp310-cp310-win_amd64.whl
 │   └── insightface-0.7.3-cp311-cp311-win_amd64.whl
 │
-├── Icon/                           # Dashboard SVG icons
-│   ├── LOGO.svg
-│   ├── Detection.svg
-│   ├── Fall.svg
-│   ├── Fire.svg
-│   ├── Face.svg
-│   ├── Camera.svg
-│   ├── Register.svg
-│   └── Notifcation.svg
+├── Icon/                           # Logo + UI icon set (SVG, 24px grid, currentColor)
+│   ├── LOGO.svg                    #   logo mark (shield + house + lens)
+│   ├── HomeShield.svg              #   logo with wordmark
+│   └── Camera, CameraOff, Capture, Detection, Events, Face, Fall, Fire, Info, Live,
+│       Menu, Notification, Performance, Persons, Register, Settings, Users, Zones (.svg)
 │
 ├── UML_Diagrams/                   # PlantUML sources + rendered PNGs
 │   ├── puml/                       #   .puml source files (use case, class, FSMs, …)
@@ -419,6 +435,8 @@ FYP/
 │   ├── pipeline.py                 #   per-camera pipeline + Models + FaceWorker
 │   ├── cameras.py                  #   multi-camera lifecycle manager
 │   ├── events.py                   #   async EventBus + SQLite log + snapshots
+│   ├── incidents.py                #   detections grouped into incidents + resolutions
+│   ├── notify.py                   #   per-incident WhatsApp alerts (Twilio, opt-in)
 │   ├── persons.py                  #   registered persons + intruder log
 │   ├── zones.py                    #   polygon zone storage + point-in-polygon
 │   ├── settings.py                 #   hot-reloadable settings store
@@ -453,6 +471,7 @@ FYP/
 ## 🔐 Privacy & security
 
 - **All inference runs locally.** No frames, embeddings, or events ever leave your machine. There is no cloud component, no telemetry, and no third-party API calls during detection — HomeShield only touches the network to pull RTSP/HTTP streams from cameras you explicitly add.
+- **The one opt-in exception: WhatsApp alerts.** If you add Twilio credentials, each new or escalated incident sends a short text (what, which camera, when, confidence) through Twilio to the numbers you list. No images or face data are sent. Leave the Twilio details empty (in Settings and `.env`) to keep HomeShield fully offline. A token saved in Settings sits in `homeshield.db`, so treat that file as a secret (it already holds camera passwords).
 - **Built-in user authentication.** The dashboard ships with a login layer (`homeshield/auth.py`) backed by hashed passwords in the local SQLite DB. On first run you'll be prompted to create the initial admin account; every API and stream endpoint then requires an authenticated session. Change a password from **Account → Settings**, and revoke a leaked session by clearing the `users` / `sessions` rows in `homeshield.db`.
 - **Face embeddings, not photos**, are used for matching at runtime. The 512-dim ArcFace vectors live in the local SQLite DB. Original enrolment photos are kept in `person_photos/` so you can re-enrol after a model swap.
 - **Intruder snapshots** are stored in `intruder_photos/` on disk. Delete them whenever you want — the entry in the UI will disappear with them. The same applies to event snapshots in `snapshots/`.
@@ -503,7 +522,7 @@ You're probably on the main / high-quality stream. Switch to the camera's sub-st
 Both devices must be on the **same Wi-Fi network** (not Wi-Fi vs guest network, not cellular). Open the URL in a browser first to confirm the stream is reachable, then paste it into HomeShield.
 
 **Every family member gets logged as an intruder**
-You enabled face detection before enrolling them. Disable face detection, enrol everyone in **Persons**, then re-enable.
+They haven't been registered yet. Register them from **People → Intruders seen** (or with **Register a person**); new detections will then name them.
 
 **Dashboard reachable from your laptop but not your phone**
 Server is bound to `127.0.0.1`. Restart with `--host 0.0.0.0` (the default), and check Windows Firewall isn't blocking inbound TCP/5000.

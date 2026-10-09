@@ -4,6 +4,7 @@ CaptureWorker, CameraManager."""
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -46,7 +47,7 @@ class CameraStore:
             cur = conn.execute(
                 "INSERT INTO cameras (name, url, location) VALUES (?, ?, ?)",
                 (name.strip() or "Camera",
-                 url.strip() or "0",
+                 _strip_quotes(url) or "0",
                  location.strip()),
             )
             return cur.lastrowid
@@ -81,6 +82,7 @@ class LatestFrame:
         self._version = 0
         self._jpeg: Optional[bytes] = None
         self._jpeg_version = -1
+        self._size: Optional[tuple[int, int]] = None   # (w, h) of the last camera frame
 
     def set(self, display: np.ndarray, raw: Optional[np.ndarray] = None) -> None:
         """Publish a new frame. Takes ownership: callers must not modify either
@@ -88,8 +90,15 @@ class LatestFrame:
         with self._cond:
             self._display = display
             self._raw = raw
+            if raw is not None:     # placeholders (no raw frame) keep the last real size
+                self._size = (int(raw.shape[1]), int(raw.shape[0]))
             self._version += 1
             self._cond.notify_all()
+
+    def size(self) -> Optional[tuple[int, int]]:
+        """(width, height) of the camera's frames, once one has arrived."""
+        with self._cond:
+            return self._size
 
     def _encoded(self) -> tuple[Optional[bytes], int]:
         with self._cond:
@@ -192,9 +201,29 @@ class WorkerStatus:
     fps: float = 0.0
 
 
+def _strip_quotes(s: str) -> str:
+    """Drop surrounding quotes: Windows' "Copy as path" adds them, and OpenCV
+    would otherwise look for a file whose name includes the quote marks."""
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        s = s[1:-1].strip()
+    return s
+
+
+def describe_source(url) -> str:
+    """A camera source safe to show anyone: no password, path or query."""
+    src = _parse_source(url)
+    if isinstance(src, int):
+        return f"webcam {src}"
+    if _is_file_source(src):
+        return Path(src).name
+    m = re.match(r"^([a-zA-Z][\w+.-]*)://(?:[^@/]*@)?([^/?#]+)", str(src))
+    return f"{m.group(1)}://{m.group(2)}" if m else "camera"
+
+
 def _parse_source(s):
     if isinstance(s, str):
-        s = s.strip()
+        s = _strip_quotes(s)
         if s.isdigit():
             return int(s)
     return s
@@ -237,13 +266,16 @@ class CaptureWorker(threading.Thread):
     def _open(self):
         src = _parse_source(self.camera["url"])
         cap = cv2.VideoCapture(src)
-        if not cap.isOpened():
+        if not cap.isOpened() and isinstance(src, int):
+            # Windows webcam fallback. DirectShow only opens devices by index:
+            # for a URL or file path it just prints "can't be used to capture
+            # by name", so only try it for device numbers.
             try:
-                cap = cv2.VideoCapture(src, cv2.CAP_DSHOW)  # Windows fallback
+                cap = cv2.VideoCapture(src, cv2.CAP_DSHOW)
             except Exception:
                 pass
-            if not cap.isOpened():
-                return None
+        if not cap.isOpened():
+            return None
         # Keep buffer tiny so inference lag doesn't pile up stale frames.
         try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -258,10 +290,15 @@ class CaptureWorker(threading.Thread):
         backoff = 1.0
         cname = self.camera["name"]
         is_file = _is_file_source(_parse_source(self.camera["url"]))
+        open_failing = False
 
         while not self._stop_flag.is_set():
             cap = self._open()
             if cap is None:
+                if not open_failing:    # once per outage, not on every retry
+                    log.warning("camera %r: cannot open source %r (retrying)",
+                                cname, self.camera["url"])
+                    open_failing = True
                 if self.status.camera_connected:
                     self._sys_event(f"Camera disconnected ({self.camera['url']})", 0.0)
                 self.status.camera_connected = False
@@ -272,8 +309,9 @@ class CaptureWorker(threading.Thread):
                 backoff = min(10.0, backoff * 1.7)
                 continue
 
+            open_failing = False
             if not self.status.camera_connected:
-                self._sys_event(f"Camera connected ({self.camera['url']})", 1.0)
+                self._sys_event(f"Camera connected ({describe_source(self.camera['url'])})", 1.0)
             self.status.camera_connected = True
             self.status.last_error = None
             backoff = 1.0
@@ -286,7 +324,7 @@ class CaptureWorker(threading.Thread):
                     self._loop_live(cap)
             except Exception as e:
                 self.status.last_error = repr(e)
-                self._sys_event(f"Pipeline error: {e}", 0.0)
+                self._sys_event(f"Video processing stopped: {e}", 0.0)
             finally:
                 self.status.camera_connected = False
 
@@ -439,6 +477,8 @@ class CameraManager:
             cid = c["camera_id"]
             w = self._workers.get(cid)
             pipe = self._pipelines.get(cid)
+            latest = self._frames.get(cid)
+            size = latest.size() if latest else None
             active = bool(w and w.status.camera_connected)
             cam_people = (len(pipe.fall_state.detectors) if pipe else 0)
             if active:
@@ -451,6 +491,10 @@ class CameraManager:
                 "active": active,
                 "fps": round(w.status.fps, 1) if w else 0.0,
                 "people": cam_people,
+                # Native frame size, so the dashboard can show the selected
+                # camera in its own aspect ratio.
+                "width": size[0] if size else None,
+                "height": size[1] if size else None,
             }
         return out
 

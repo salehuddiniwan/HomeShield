@@ -20,6 +20,12 @@ DEFAULTS: dict[str, Any] = {
     "alert_cooldown": 60,
     "alert_phones": "",
 
+    # WhatsApp alerts through Twilio. Values saved here win over the .env
+    # file; the auth token is never sent back to the browser.
+    "twilio_account_sid": "",
+    "twilio_auth_token": "",
+    "twilio_whatsapp_from": "",
+
     # YOLO pose
     "yolo_model": "yolo11n-pose.pt",
     "yolo_confidence": 0.50,

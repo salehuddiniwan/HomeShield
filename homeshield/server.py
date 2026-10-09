@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
+import re
 import queue
 import secrets
 from datetime import timedelta
@@ -17,10 +19,12 @@ from flask import (Flask, Response, abort, jsonify, render_template, request,
 from .auth import (ROLE_ADMIN, ROLE_GUEST, UserStore, login_session,
                    logout_session, require_admin, require_login,
                    session_user_id)
-from .cameras import CameraManager
+from .cameras import CameraManager, _strip_quotes
 from .db import init_db, write_conn
 from .detectors.face import is_good_face
-from .events import EventBus
+from .events import Event, EventBus
+from .incidents import KINDS, NOTE_MAX, OUTCOMES, STATUSES, IncidentStore
+from .notify import WhatsAppNotifier
 from .paths import ICON_DIR
 from .persons import IntruderStore, PersonStore
 from .pipeline import Models, list_fire_models, list_pose_models
@@ -76,6 +80,88 @@ def _int_arg(value: Any, default: int, lo: int, hi: int) -> int:
         return default
 
 
+# ---- request validation ---------------------------------------------------
+
+NAME_MAX = 60
+URL_MAX = 500
+ZONE_POINTS_MAX = 64
+PERSON_CATEGORIES = ("child", "adult", "elderly")
+SECRET_SETTINGS = ("twilio_auth_token",)
+_TWILIO_SID_RE = re.compile(r"^AC[0-9a-fA-F]{32}$")
+_TWILIO_TOKEN_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+_E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
+
+
+def _twilio_fields(data: dict[str, Any]) -> None:
+    """Check and normalise the Twilio fields of a settings save, in place.
+
+    An empty auth token means "keep the saved one"; twilio_auth_token_clear
+    removes it. An empty SID or sender clears that value.
+    """
+    if "twilio_account_sid" in data:
+        sid = str(data["twilio_account_sid"] or "").strip()
+        if sid and not _TWILIO_SID_RE.match(sid):
+            raise BadInput("The Account SID is AC followed by 32 letters and "
+                           "numbers. Copy it from the Twilio Console home page.")
+        data["twilio_account_sid"] = sid
+    if "twilio_whatsapp_from" in data:
+        sender = re.sub(r"[\s\-().]", "", str(data["twilio_whatsapp_from"] or ""))
+        sender = sender.removeprefix("whatsapp:")
+        if sender and not _E164_RE.match(sender):
+            raise BadInput("The WhatsApp sender is a phone number with its "
+                           "country code, e.g. +14155238886 for the Twilio sandbox.")
+        data["twilio_whatsapp_from"] = sender
+    if data.pop("twilio_auth_token_clear", False):
+        data["twilio_auth_token"] = ""
+    elif "twilio_auth_token" in data:
+        token = str(data["twilio_auth_token"] or "").strip()
+        if not token:
+            data.pop("twilio_auth_token")          # blank field: keep the saved token
+        elif not _TWILIO_TOKEN_RE.match(token):
+            raise BadInput("The auth token is 32 letters and numbers. Copy it "
+                           "from the Twilio Console (Account info).")
+        else:
+            data["twilio_auth_token"] = token
+
+
+class BadInput(ValueError):
+    """A request field failed validation; answered as HTTP 400."""
+
+
+def _text(data: dict[str, Any], key: str, label: str, *,
+          default: str = "", max_len: int = NAME_MAX) -> str:
+    value = str(data.get(key) or "").strip() or default
+    if len(value) > max_len:
+        raise BadInput(f"{label} is too long ({max_len} characters max)")
+    return value
+
+
+def _category(data: dict[str, Any]) -> str:
+    value = str(data.get("category") or "adult").strip().lower()
+    if value not in PERSON_CATEGORIES:
+        raise BadInput("Category must be child, adult or elderly")
+    return value
+
+
+def _polygon(value: Any) -> list[list[float]]:
+    """Validate a zone drawn on the 640x480 reference canvas; clamp to it."""
+    if not isinstance(value, list) or not 3 <= len(value) <= ZONE_POINTS_MAX:
+        raise BadInput(f"A zone needs 3 to {ZONE_POINTS_MAX} points")
+    out = []
+    for p in value:
+        if not isinstance(p, (list, tuple)) or len(p) != 2:
+            raise BadInput("Zone points must be [x, y] pairs")
+        try:
+            x, y = float(p[0]), float(p[1])
+        except (TypeError, ValueError):
+            raise BadInput("Zone points must be numbers") from None
+        if not (math.isfinite(x) and math.isfinite(y)):
+            raise BadInput("Zone points must be numbers")
+        out.append([min(max(x, 0.0), float(ZoneStore.REF_W)),
+                    min(max(y, 0.0), float(ZoneStore.REF_H))])
+    return out
+
+
 # ---- factory --------------------------------------------------------------
 
 def create_app(*, db_path: str = "homeshield.db",
@@ -117,11 +203,22 @@ def create_app(*, db_path: str = "homeshield.db",
     user_store = UserStore(db_path)
     app.extensions["homeshield_users"] = user_store
 
+    @app.errorhandler(BadInput)
+    def _bad_input(e: BadInput):
+        return jsonify({"error": str(e)}), 400
+
     settings = SettingsStore(db_path)
     bus = EventBus(db_path=db_path, snapshot_dir=snap_path)
     person_store = PersonStore(db_path=db_path, photos_dir=person_dir)
     intruder_store = IntruderStore(db_path=db_path, photos_dir=intruder_dir)
     zone_store = ZoneStore(db_path=db_path)
+    incident_store = IncidentStore(db_path)
+    try:
+        incident_store.backfill()      # group events logged before incidents existed
+    except Exception as e:
+        log.exception("incident backfill failed: %s", e)
+    notifier = WhatsAppNotifier(settings)
+    bus.add_incident_listener(notifier.on_incident)
     models = Models(settings=settings)
     manager = CameraManager(
         db_path=db_path, models=models, settings=settings, bus=bus,
@@ -153,6 +250,11 @@ def create_app(*, db_path: str = "homeshield.db",
             "role": row["role"],
             "must_change_password": bool(row.get("must_change", 0)),
         }
+
+    # Public: the sign-in card shows the default login only while it works.
+    @app.route("/api/setup_state")
+    def api_setup_state():
+        return jsonify({"default_admin": user_store.default_admin_active()})
 
     @app.route("/api/login", methods=["POST"])
     def api_login():
@@ -203,7 +305,7 @@ def create_app(*, db_path: str = "homeshield.db",
         if not row["must_change"]:
             current = str(data.get("current_password", ""))
             if user_store.verify(row["username"], current) is None:
-                return jsonify({"error": "current password is incorrect"}), 400
+                return jsonify({"error": "Your current password is wrong."}), 400
         try:
             user_store.update_password(uid, new_pw)
         except ValueError as e:
@@ -240,13 +342,13 @@ def create_app(*, db_path: str = "homeshield.db",
     @require_admin
     def api_users_delete(uid: int):
         if uid == session_user_id():
-            return jsonify({"error": "cannot delete your own account"}), 400
+            return jsonify({"error": "You can't delete the account you're signed in with."}), 400
         try:
             ok = user_store.delete_user(uid)
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
         if not ok:
-            return jsonify({"error": "not found"}), 404
+            return jsonify({"error": "That user no longer exists."}), 404
         return jsonify({"ok": True})
 
     @app.route("/api/users/<int:uid>/role", methods=["POST"])
@@ -255,13 +357,13 @@ def create_app(*, db_path: str = "homeshield.db",
         data = request.get_json(silent=True) or {}
         role = str(data.get("role", "")).strip().lower()
         if uid == session_user_id() and role != ROLE_ADMIN:
-            return jsonify({"error": "cannot demote yourself"}), 400
+            return jsonify({"error": "You can't remove your own admin role."}), 400
         try:
             ok = user_store.update_role(uid, role)
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
         if not ok:
-            return jsonify({"error": "not found"}), 404
+            return jsonify({"error": "That user no longer exists."}), 404
         return jsonify({"ok": True})
 
     @app.route("/api/users/<int:uid>/password", methods=["POST"])
@@ -274,7 +376,7 @@ def create_app(*, db_path: str = "homeshield.db",
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
         if not ok:
-            return jsonify({"error": "not found"}), 404
+            return jsonify({"error": "That user no longer exists."}), 404
         # Admin-issued resets force the user to pick their own next time.
         with write_conn(db_path) as conn:
             conn.execute(
@@ -284,14 +386,22 @@ def create_app(*, db_path: str = "homeshield.db",
 
     # ===== Status & system ==============================================
 
+    def _is_admin() -> bool:
+        me = user_store.get(session_user_id()) or {}
+        return me.get("role") == ROLE_ADMIN
+
     @app.route("/api/status")
     @require_login
     def api_status():
         out = manager.status()
+        if not _is_admin():   # camera sources can carry RTSP passwords
+            for cam in out.get("cameras", {}).values():
+                cam.pop("url", None)
         s = settings.all()
         out['fall_enabled'] = bool(s.get('fall_enabled', True))
         out['fire_enabled'] = bool(s.get('fire_enabled', True))
         out['face_enabled'] = bool(s.get('face_enabled', True))
+        out.update(incident_store.open_counts())
         return jsonify(out)
 
     @app.route("/api/system/start", methods=["POST"])
@@ -328,17 +438,24 @@ def create_app(*, db_path: str = "homeshield.db",
     @app.route("/api/cameras")
     @require_login
     def api_cameras_list():
-        return jsonify(manager.store.list())
+        cams = manager.store.list()
+        if not _is_admin():   # camera sources can carry RTSP passwords
+            cams = [{k: v for k, v in c.items() if k != "url"} for c in cams]
+        return jsonify(cams)
 
     @app.route("/api/cameras", methods=["POST"])
     @require_admin
     def api_cameras_add():
         data = request.get_json(silent=True) or {}
-        cid = manager.add_camera(
-            name=str(data.get("name", "Camera")),
-            url=str(data.get("url", "0")),
-            location=str(data.get("location", "")),
-        )
+        name = _text(data, "name", "Camera name", default="Camera")
+        url = _strip_quotes(str(data.get("url") or ""))
+        if not url:
+            raise BadInput("Enter a camera source: 0 for the built-in webcam, "
+                           "or an rtsp:// or http:// address")
+        if len(url) > URL_MAX:
+            raise BadInput(f"Camera source is too long ({URL_MAX} characters max)")
+        location = _text(data, "location", "Location")
+        cid = manager.add_camera(name=name, url=url, location=location)
         return jsonify({"camera_id": cid, "ok": True})
 
     @app.route("/api/cameras/<int:cid>", methods=["DELETE"])
@@ -368,6 +485,10 @@ def create_app(*, db_path: str = "homeshield.db",
             version = -1
             while True:
                 jpeg, version = latest.get_blocking(version, timeout=1.0)
+                # Camera removed or system stopped: end the stream instead of
+                # replaying its last frame to the open tab forever.
+                if manager.latest(cid) is not latest:
+                    return
                 if jpeg is None:
                     continue
                 yield (b"--frame\r\n"
@@ -377,8 +498,11 @@ def create_app(*, db_path: str = "homeshield.db",
         return Response(gen(),
                         mimetype="multipart/x-mixed-replace; boundary=frame")
 
+    # Login, not admin: guests already watch /video_feed, and the dashboard
+    # shows stills instead of extra streams to stay under the browser's
+    # per-server connection limit.
     @app.route("/frame_snap/<int:cid>")
-    @require_admin
+    @require_login
     def frame_snap(cid: int):
         latest = manager.latest(cid)
         if latest is None:
@@ -439,12 +563,89 @@ def create_app(*, db_path: str = "homeshield.db",
                     except queue.Empty:
                         yield ": keep-alive\n\n"
                         continue
-                    yield f"event: alert\ndata: {json.dumps(ev.to_json())}\n\n"
+                    if isinstance(ev, Event):
+                        yield f"event: alert\ndata: {json.dumps(ev.to_json())}\n\n"
+                    else:
+                        yield f"event: {ev['sse']}\ndata: {json.dumps(ev['data'])}\n\n"
             finally:
                 bus.unsubscribe(q)
         return Response(gen(), mimetype="text/event-stream",
                         headers={"Cache-Control": "no-cache",
                                  "X-Accel-Buffering": "no"})
+
+    # ===== Incidents ====================================================
+    # Anyone signed in may close an incident (family members handle alerts
+    # at home); the record keeps who did it. Clearing stays admin-only.
+
+    @app.route("/api/incidents/board")
+    @require_login
+    def api_incidents_board():
+        recent = _int_arg(request.args.get("recent"), 6, 0, 50)
+        return jsonify(incident_store.board(recent=recent))
+
+    @app.route("/api/incidents")
+    @require_login
+    def api_incidents():
+        status = request.args.get("status") or None
+        if status not in (None, "resolved", *STATUSES):
+            raise BadInput("Unknown status filter")
+        kind = request.args.get("kind") or None
+        if kind not in (None, *KINDS):
+            raise BadInput("Unknown incident type")
+        cam = request.args.get("camera_id")
+        camera_id = _int_arg(cam, -1, 0, 2**31 - 1) if cam else None
+        limit = _int_arg(request.args.get("limit"), 50, 1, 500)
+        return jsonify(incident_store.list(status=status, kind=kind,
+                                           camera_id=camera_id, limit=limit))
+
+    @app.route("/api/incidents/stats")
+    @require_login
+    def api_incidents_stats():
+        days = _int_arg(request.args.get("days"), 7, 1, 365)
+        return jsonify(incident_store.stats(days=days))
+
+    @app.route("/api/incidents/<int:iid>")
+    @require_login
+    def api_incident(iid: int):
+        inc = incident_store.get(iid, with_events=True)
+        if inc is None:
+            return jsonify({"error": "That incident no longer exists"}), 404
+        return jsonify(inc)
+
+    @app.route("/api/incidents/<int:iid>/resolve", methods=["POST"])
+    @require_login
+    def api_incident_resolve(iid: int):
+        data = request.get_json(silent=True) or {}
+        outcome = str(data.get("outcome") or "")
+        if outcome not in OUTCOMES:
+            raise BadInput("Choose Acknowledge or False alarm")
+        note = _text(data, "note", "Note", max_len=NOTE_MAX)
+        me = user_store.get(session_user_id()) or {}
+        inc = incident_store.resolve(iid, outcome=outcome, note=note,
+                                     by=me.get("username") or "unknown")
+        if inc is None:
+            return jsonify({"error": "That incident no longer exists"}), 404
+        bus.broadcast("incident", {**inc, "change": "resolved"})
+        return jsonify(inc)
+
+    # ===== Notifications ================================================
+
+    @app.route("/api/notify/status")
+    @require_admin
+    def api_notify_status():
+        return jsonify(notifier.status())
+
+    @app.route("/api/notify/test", methods=["POST"])
+    @require_admin
+    def api_notify_test():
+        st = notifier.status()
+        if st["missing"]:
+            raise BadInput("Twilio is not set up yet. Fill in " + ", ".join(st["missing"])
+                           + " under Twilio account and save, then try again.")
+        if not st["phones"]:
+            raise BadInput("Add at least one phone number with its country "
+                           "code (e.g. +60123456789) and save first")
+        return jsonify(notifier.send_test())
 
     # ===== Zones ========================================================
 
@@ -459,11 +660,13 @@ def create_app(*, db_path: str = "homeshield.db",
         data = request.get_json(silent=True) or {}
         cam_id = _int_arg(data.get("camera_id"), -1, 0, 2**31 - 1)
         if cam_id < 0:
-            return jsonify({"error": "camera_id must be an integer"}), 400
+            return jsonify({"error": "Pick a camera first."}), 400
+        if cam_id not in {c["camera_id"] for c in manager.store.list()}:
+            return jsonify({"error": "That camera no longer exists"}), 400
         zid = zone_store.add(
-            zone_name=str(data.get("zone_name", "Zone")),
+            zone_name=_text(data, "zone_name", "Zone name", default="Zone"),
             camera_id=cam_id,
-            polygon=list(data.get("polygon") or []),
+            polygon=_polygon(data.get("polygon")),
             zone_type=str(data.get("zone_type", "danger")),
         )
         return jsonify({"ok": True, "zone_id": zid})
@@ -489,6 +692,8 @@ def create_app(*, db_path: str = "homeshield.db",
         return jsonify({
             "face_rec_enabled": bool(models.face_engine
                                      and models.face_engine.available),
+            # Lets the page tell "switched off in Settings" from "failed to load".
+            "face_setting": bool(settings.get("face_enabled", True)),
             "persons": person_store.list(),
         })
 
@@ -496,29 +701,34 @@ def create_app(*, db_path: str = "homeshield.db",
     @require_admin
     def api_persons_add():
         data = request.get_json(silent=True) or {}
-        name = str(data.get("name", "")).strip()
-        category = str(data.get("category", "adult"))
+        name = _text(data, "name", "Name")
+        category = _category(data)
         cid = data.get("camera_id")
         if not name:
-            return jsonify({"error": "Name required"}), 400
+            return jsonify({"error": "Enter the person's name."}), 400
         if not models.face_engine or not models.face_engine.available:
-            return jsonify({"error": "Face recognition not available. "
+            return jsonify({"error": "Face recognition is off, so nobody can be "
+                                     "registered. Turn it on in Settings > Face "
+                                     "recognition. "
                                      "Install insightface + onnxruntime."}), 400
         if cid is None:
-            return jsonify({"error": "Select a camera"}), 400
+            return jsonify({"error": "Pick a camera to capture from."}), 400
         cam_id = _int_arg(cid, -1, 0, 2**31 - 1)
         latest = manager.latest(cam_id) if cam_id >= 0 else None
         if latest is None:
-            return jsonify({"error": "Camera not running"}), 400
+            return jsonify({"error": "That camera isn't running. Start monitoring "
+                                     "or check the camera, then try again."}), 400
         frame = latest.raw()
         if frame is None:
-            return jsonify({"error": "No frame from camera"}), 400
+            return jsonify({"error": "No picture from that camera yet. "
+                                     "Wait a moment and try again."}), 400
         face = models.face_engine.best_face(frame)
         if not face or face.get("embedding") is None:
-            return jsonify({"error": "No face found in frame"}), 400
+            return jsonify({"error": "No face in view. Ask the person to look "
+                                     "straight at the camera."}), 400
         if not _face_ok(face):
-            return jsonify({"error": "Face too small or unclear - move closer to "
-                                     "the camera and face it directly"}), 400
+            return jsonify({"error": "The face is too small or blurry. Move closer "
+                                     "and face the camera directly."}), 400
         info = person_store.add(
             name=name, category=category,
             embedding=face["embedding"],
@@ -581,15 +791,16 @@ def create_app(*, db_path: str = "homeshield.db",
     @require_admin
     def api_intruders_register(iid: int):
         data = request.get_json(silent=True) or {}
-        name = str(data.get("name", "")).strip()
-        category = str(data.get("category", "adult"))
+        name = _text(data, "name", "Name")
+        category = _category(data)
         if not name:
-            return jsonify({"error": "Name required"}), 400
+            return jsonify({"error": "Enter the person's name."}), 400
         rec = intruder_store.get(iid)
         if rec is None:
-            return jsonify({"error": "Intruder not found"}), 404
+            return jsonify({"error": "That intruder record no longer exists."}), 404
         if rec.get("embedding") is None:
-            return jsonify({"error": "Intruder has no embedding"}), 400
+            return jsonify({"error": "This record has no face data to "
+                                     "register from."}), 400
         info = person_store.add(
             name=name, category=category,
             embedding=rec["embedding"],
@@ -606,19 +817,33 @@ def create_app(*, db_path: str = "homeshield.db",
 
     # ===== Settings =====================================================
 
+    def _public_settings() -> dict[str, Any]:
+        """All settings except secrets, plus whether a token is saved."""
+        out = settings.all()
+        token = str(out.get("twilio_auth_token") or "")
+        for k in SECRET_SETTINGS:
+            out.pop(k, None)
+        out["twilio_token_saved"] = bool(token)
+        out["twilio_token_hint"] = token[-4:] if len(token) >= 8 else ""
+        return out
+
     @app.route("/api/settings")
     @require_admin
     def api_settings_get():
-        return jsonify(settings.all())
+        return jsonify(_public_settings())
 
     @app.route("/api/settings", methods=["POST"])
     @require_admin
     def api_settings_post():
         data, bad = _coerce_settings(request.get_json(silent=True) or {})
         if bad:
-            return jsonify({"error": "invalid value for: " + ", ".join(bad)}), 400
-        out = settings.update(data)
+            return jsonify({"error": "These settings need a number: "
+                                     + ", ".join(bad)}), 400
+        for k in ("twilio_token_saved", "twilio_token_hint"):   # read-only fields
+            data.pop(k, None)
+        _twilio_fields(data)
+        settings.update(data)
         manager.reload_settings()
-        return jsonify(out)
+        return jsonify(_public_settings())
 
     return app

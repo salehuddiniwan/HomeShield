@@ -4,7 +4,8 @@ Event types: fall_detected, lying_motionless, inactivity, zone_entry,
 intruder_detected, fire_detected, normal, system.
 
 `publish()` is non-blocking: it copies the frame and enqueues onto an
-internal queue. A daemon thread does the snapshot + DB + SSE fan-out.
+internal queue. A daemon thread does the snapshot + DB + SSE fan-out, and
+files each alert into its incident (incidents.py) in the same transaction.
 """
 
 from __future__ import annotations
@@ -17,12 +18,13 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import cv2
 import numpy as np
 
 from .db import read_conn, write_conn
+from .incidents import assign as assign_incident
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +49,10 @@ class Event:
     bbox: Optional[tuple[float, float, float, float]] = None
     meta: dict[str, Any] = field(default_factory=dict)
     event_id: Optional[int] = None
+    incident_id: Optional[int] = None
+    # The incident after this event was filed, plus "change": opened /
+    # updated / escalated. Sent with the SSE alert, not stored.
+    incident: Optional[dict[str, Any]] = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -62,6 +68,8 @@ class Event:
             "snapshot_path": self.snapshot_path,
             "bbox": list(self.bbox) if self.bbox else None,
             "meta": self.meta,
+            "incident_id": self.incident_id,
+            "incident": self.incident,
         }
 
 
@@ -158,6 +166,7 @@ def _row_to_dict(r) -> dict[str, Any]:
         "snapshot_path": r["snapshot_path"],
         "bbox": json.loads(r["bbox_json"]) if r["bbox_json"] else None,
         "meta": json.loads(r["meta_json"]) if r["meta_json"] else {},
+        "incident_id": r["incident_id"] if "incident_id" in r.keys() else None,
     }
 
 
@@ -176,6 +185,7 @@ class EventBus:
         self._sub_lock = threading.Lock()
         self._pub_q: queue.Queue = queue.Queue(maxsize=publish_queue_size)
         self._pub_dropped = 0
+        self._incident_listeners: list[Callable[[str, dict], None]] = []
         threading.Thread(target=self._publisher_loop,
                          name="hs-event-publisher", daemon=True).start()
 
@@ -193,6 +203,28 @@ class EventBus:
                 self._subs.remove(q)
             except ValueError:
                 pass
+
+    def add_incident_listener(self, fn: Callable[[str, dict], None]) -> None:
+        """fn(change, incident) runs on the publisher thread; keep it quick."""
+        self._incident_listeners.append(fn)
+
+    def broadcast(self, name: str, data: dict[str, Any]) -> None:
+        """Push a non-alert SSE message (e.g. an incident was resolved)."""
+        self._fan_out({"sse": name, "data": data})
+
+    def _fan_out(self, item) -> None:
+        # Non-blocking; drop the oldest message if a subscriber lags.
+        with self._sub_lock:
+            subs = list(self._subs)
+        for q in subs:
+            try:
+                q.put_nowait(item)
+            except queue.Full:
+                try:
+                    q.get_nowait()
+                    q.put_nowait(item)
+                except Exception:
+                    pass
 
     # ---- publish (non-blocking) ----------------------------------------
 
@@ -241,19 +273,18 @@ class EventBus:
                 ),
             )
             ev.event_id = cur.lastrowid
+            change, inc = assign_incident(conn, ev)
+            if inc is not None:
+                ev.incident_id = inc["incident_id"]
+                ev.incident = {**inc, "change": change}
 
-        # SSE fan-out (non-blocking; drop oldest if a subscriber lags)
-        with self._sub_lock:
-            subs = list(self._subs)
-        for q in subs:
-            try:
-                q.put_nowait(ev)
-            except queue.Full:
+        if ev.incident is not None:
+            for fn in self._incident_listeners:
                 try:
-                    q.get_nowait()
-                    q.put_nowait(ev)
-                except Exception:
-                    pass
+                    fn(ev.incident["change"], ev.incident)
+                except Exception as e:
+                    log.warning("incident listener failed: %s", e)
+        self._fan_out(ev)
 
     # ---- queries --------------------------------------------------------
 
@@ -287,4 +318,5 @@ class EventBus:
     def clear(self) -> int:
         with write_conn(self.db_path) as conn:
             cur = conn.execute("DELETE FROM events")
+            conn.execute("DELETE FROM incidents")
             return cur.rowcount or 0

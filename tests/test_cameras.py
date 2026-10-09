@@ -78,3 +78,25 @@ def test_grabber_keeps_latency_bounded_when_inference_is_slow():
         g.join(timeout=2.0)
     assert max(ages[3:]) < 0.06            # never more than ~2 stream frames old
     assert cap.released                    # grabber released the capture
+
+
+def test_camera_source_parsing_strips_copy_as_path_quotes(tmp_path):
+    from homeshield.cameras import _is_file_source, _parse_source
+    video = tmp_path / "clip with spaces.mp4"
+    video.write_bytes(b"")
+    assert _parse_source(f'"{video}"') == str(video)
+    assert _parse_source(f"  '{video}' ") == str(video)
+    assert _is_file_source(_parse_source(f'"{video}"'))
+    assert _parse_source(" 0 ") == 0
+    assert _parse_source('"1"') == 1
+    assert _parse_source("rtsp://cam/stream") == "rtsp://cam/stream"
+
+
+def test_latest_frame_reports_camera_size_not_placeholder_size():
+    lf = LatestFrame()
+    assert lf.size() is None
+    cam = np.zeros((720, 1280, 3), np.uint8)
+    lf.set(cam, cam)
+    assert lf.size() == (1280, 720)
+    lf.set(np.zeros((540, 960, 3), np.uint8))      # offline placeholder, no raw frame
+    assert lf.size() == (1280, 720)

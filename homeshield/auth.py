@@ -77,6 +77,10 @@ class UserStore:
             ).fetchone()
         return dict(r) if r else None
 
+    def default_admin_active(self) -> bool:
+        """True while the seeded admin/admin login still works (first run)."""
+        return self.verify(DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD) is not None
+
     def get_by_username(self, username: str) -> Optional[dict[str, Any]]:
         username = (username or "").strip()
         if not username:
@@ -92,12 +96,12 @@ class UserStore:
                     must_change: bool = False) -> dict[str, Any]:
         username = (username or "").strip()
         if not username:
-            raise ValueError("username is required")
+            raise ValueError("Enter a username.")
         if len(username) > 64:
-            raise ValueError("username is too long")
+            raise ValueError("Usernames can be up to 64 characters.")
         if not password or len(password) < MIN_PASSWORD_LENGTH:
             raise ValueError(
-                f"password must be at least {MIN_PASSWORD_LENGTH} characters"
+                f"Passwords need at least {MIN_PASSWORD_LENGTH} characters."
             )
         if role not in VALID_ROLES:
             role = ROLE_GUEST
@@ -111,7 +115,7 @@ class UserStore:
                 )
                 uid = cur.lastrowid
         except sqlite3.IntegrityError:
-            raise ValueError(f"username '{username}' already exists")
+            raise ValueError(f"There is already a user called {username}.")
         return {
             "user_id": uid,
             "username": username,
@@ -126,7 +130,7 @@ class UserStore:
         if target is None:
             return False
         if target["role"] == ROLE_ADMIN and self.count_admins() <= 1:
-            raise ValueError("cannot delete the last admin")
+            raise ValueError("You can't delete the last admin. Make someone else an admin first.")
         with write_conn(self.db_path) as conn:
             cur = conn.execute(
                 "DELETE FROM users WHERE user_id = ?", (user_id,)
@@ -135,7 +139,7 @@ class UserStore:
 
     def update_role(self, user_id: int, role: str) -> bool:
         if role not in VALID_ROLES:
-            raise ValueError(f"invalid role: {role}")
+            raise ValueError("Role must be admin or guest.")
         user_id = int(user_id)
         target = self.get(user_id)
         if target is None:
@@ -143,7 +147,7 @@ class UserStore:
         # Demoting the last admin would lock everyone out of /api/users.
         if target["role"] == ROLE_ADMIN and role != ROLE_ADMIN \
                 and self.count_admins() <= 1:
-            raise ValueError("cannot demote the last admin")
+            raise ValueError("You can't remove the last admin. Make someone else an admin first.")
         with write_conn(self.db_path) as conn:
             cur = conn.execute(
                 "UPDATE users SET role = ? WHERE user_id = ?",
@@ -154,7 +158,7 @@ class UserStore:
     def update_password(self, user_id: int, new_password: str) -> bool:
         if not new_password or len(new_password) < MIN_PASSWORD_LENGTH:
             raise ValueError(
-                f"password must be at least {MIN_PASSWORD_LENGTH} characters"
+                f"Passwords need at least {MIN_PASSWORD_LENGTH} characters."
             )
         pw_hash = generate_password_hash(new_password)
         with write_conn(self.db_path) as conn:

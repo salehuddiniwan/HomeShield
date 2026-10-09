@@ -83,6 +83,32 @@ CREATE TABLE IF NOT EXISTS settings (
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Alerts grouped into episodes someone can act on (see incidents.py).
+CREATE TABLE IF NOT EXISTS incidents (
+    incident_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind            TEXT    NOT NULL,
+    camera_id       INTEGER,
+    camera_name     TEXT,
+    headline_type   TEXT    NOT NULL,
+    headline_rank   INTEGER NOT NULL DEFAULT 1,
+    severity        INTEGER NOT NULL DEFAULT 1,
+    started_ts      REAL    NOT NULL,
+    last_ts         REAL    NOT NULL,
+    event_count     INTEGER NOT NULL DEFAULT 0,
+    peak_confidence REAL    NOT NULL DEFAULT 0,
+    peak_event_id   INTEGER,
+    snapshot_path   TEXT,
+    person_category TEXT    NOT NULL DEFAULT 'unknown',
+    status          TEXT    NOT NULL DEFAULT 'open',
+    escalated       INTEGER NOT NULL DEFAULT 0,
+    resolved_by     TEXT,
+    resolved_at     REAL,
+    note            TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_incidents_last   ON incidents (last_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents (status);
+CREATE INDEX IF NOT EXISTS idx_incidents_group  ON incidents (camera_id, kind, last_ts DESC);
+
 CREATE TABLE IF NOT EXISTS users (
     user_id        INTEGER PRIMARY KEY AUTOINCREMENT,
     username       TEXT    NOT NULL UNIQUE,
@@ -99,7 +125,17 @@ def init_db(db_path: PathArg) -> None:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path, timeout=10.0) as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         conn.commit()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Additive upgrades for databases created by older versions."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(events)")}
+    if "incident_id" not in cols:
+        conn.execute("ALTER TABLE events ADD COLUMN incident_id INTEGER")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_incident "
+                 "ON events (incident_id)")
 
 
 def connect(db_path: PathArg) -> sqlite3.Connection:
