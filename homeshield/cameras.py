@@ -459,6 +459,11 @@ class CameraManager:
     def is_running(self) -> bool:
         return self._running
 
+    def monitoring(self) -> bool:
+        """True while detection runs on at least one connected camera."""
+        return self._running and any(
+            w.status.camera_connected for w in list(self._workers.values()))
+
     def latest(self, camera_id: int) -> Optional[LatestFrame]:
         with self._lock:
             return self._frames.get(int(camera_id))

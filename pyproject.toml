@@ -70,4 +70,4 @@ version = { attr = "homeshield.__version__" }
 include = ["homeshield*"]
 
 [tool.setuptools.package-data]
-homeshield = ["static/*", "templates/*"]
+homeshield = ["static/fonts/*", "templates/*"]

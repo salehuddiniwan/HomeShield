@@ -1,5 +1,7 @@
 # Normalise line endings so the repo is identical on Windows / macOS / Linux.
 * text=auto eol=lf
+# cmd.exe can misread batch files with LF endings.
+*.bat  text eol=crlf
 
 # Keep binary assets binary.
 *.pt   binary
@@ -10,3 +12,4 @@
 *.png  binary
 *.svg  binary
 *.db   binary
+*.woff2 binary

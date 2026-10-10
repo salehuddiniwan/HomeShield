@@ -116,7 +116,7 @@ def test_setup_state_reports_the_default_login_only_while_it_works(tmp_path):
                      person_photos_dir=str(tmp_path / "p"),
                      intruder_photos_dir=str(tmp_path / "i"), auto_start=False)
     c = app.test_client()
-    assert c.get("/api/setup_state").get_json() == {"default_admin": True}
+    assert c.get("/api/setup_state").get_json()["default_admin"] is True
     c.post("/api/login", json={"username": "admin", "password": "admin"})
     assert c.post("/api/change_password", json={"new_password": "better-one"}).status_code == 200
-    assert c.get("/api/setup_state").get_json() == {"default_admin": False}
+    assert c.get("/api/setup_state").get_json()["default_admin"] is False

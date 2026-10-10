@@ -22,7 +22,6 @@ import socket
 from pathlib import Path
 
 from homeshield.notify import load_dotenv
-from homeshield.server import create_app
 
 
 def lan_ip() -> "str | None":
@@ -52,7 +51,28 @@ def main():
     p.add_argument("--no-autostart", action="store_true",
                    help="Don't auto-start cameras on boot (useful for debugging)")
     p.add_argument("--debug", action="store_true")
+    p.add_argument("--reset-password", metavar="USERNAME",
+                   help="Give USERNAME a temporary password and exit "
+                        "(for when the only admin has forgotten theirs)")
     args = p.parse_args()
+
+    if args.reset_password:
+        # Console recovery needs access to this computer, so it is the safe
+        # way back in when no admin can sign in. It doesn't start the server.
+        from homeshield.auth import UserStore
+        from homeshield.db import init_db
+        init_db(args.db)
+        temp = UserStore(args.db).set_temporary_password(args.reset_password)
+        if temp is None:
+            print(f"No user called '{args.reset_password}' in {Path(args.db).resolve()}")
+            raise SystemExit(1)
+        print(f"Temporary password for {args.reset_password}: {temp}")
+        print("Sign in with it on the HomeShield page; you'll then choose a new password.")
+        return
+
+    # Imported only now, so --reset-password above works (and answers at
+    # once) even when the camera and model libraries can't load.
+    from homeshield.server import create_app
 
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,

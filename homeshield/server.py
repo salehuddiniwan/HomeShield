@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import math
@@ -13,25 +14,30 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from flask import (Flask, Response, abort, jsonify, render_template, request,
-                   send_from_directory)
+from flask import (Flask, Response, abort, jsonify, make_response,
+                   render_template, request, send_from_directory, session)
 
-from .auth import (ROLE_ADMIN, ROLE_GUEST, UserStore, login_session,
-                   logout_session, require_admin, require_login,
-                   session_user_id)
+from .auth import (REMEMBER_DAYS, ROLE_ADMIN, ROLE_GUEST, LoginThrottle,
+                   UserStore, login_session, logout_session, require_admin,
+                   require_login, session_user_id)
 from .cameras import CameraManager, _strip_quotes
 from .db import init_db, write_conn
 from .detectors.face import is_good_face
 from .events import Event, EventBus
 from .incidents import KINDS, NOTE_MAX, OUTCOMES, STATUSES, IncidentStore
 from .notify import WhatsAppNotifier
-from .paths import ICON_DIR
 from .persons import IntruderStore, PersonStore
 from .pipeline import Models, list_fire_models, list_pose_models
 from .settings import SettingsStore
 from .zones import ZoneStore
 
 log = logging.getLogger(__name__)
+
+# Text shrinks 4-5x under gzip; images and video are compressed already.
+_GZIP_TYPES = frozenset({"text/html", "text/css", "text/plain", "text/javascript",
+                         "application/javascript", "application/json",
+                         "image/svg+xml"})
+_GZIP_MIN_BYTES = 1024
 
 
 # ---- settings POST coercion ----------------------------------------------
@@ -186,26 +192,56 @@ def create_app(*, db_path: str = "homeshield.db",
     app.config["JSON_SORT_KEYS"] = False
 
     # ---- session / auth config ----
+    # Sessions are signed with this key. Keep it in a file beside the
+    # database so a restart doesn't sign everyone out ("Remember me").
     secret = os.environ.get("HOMESHIELD_SECRET")
     if not secret:
-        secret = secrets.token_hex(32)
-        log.warning("HOMESHIELD_SECRET not set; using an ephemeral key "
-                    "(sessions will not survive a restart)")
+        key_file = Path(db_path).resolve().with_name("homeshield_secret.key")
+        try:
+            secret = key_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            secret = ""
+        if not secret:
+            secret = secrets.token_hex(32)
+            try:
+                key_file.write_text(secret, encoding="utf-8")
+            except OSError as e:
+                log.warning("could not save the session key (%s); sign-ins "
+                            "will not survive a restart", e)
     app.secret_key = secret
     app.config.update(
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
         # Set HOMESHIELD_COOKIE_SECURE=1 when behind HTTPS.
         SESSION_COOKIE_SECURE=os.environ.get("HOMESHIELD_COOKIE_SECURE") == "1",
-        PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+        PERMANENT_SESSION_LIFETIME=timedelta(days=REMEMBER_DAYS),
     )
 
     user_store = UserStore(db_path)
     app.extensions["homeshield_users"] = user_store
+    throttle = LoginThrottle()
+    reset_limiter = LoginThrottle()   # reuses the counting: 5 requests / 10 min / address
 
     @app.errorhandler(BadInput)
     def _bad_input(e: BadInput):
         return jsonify({"error": str(e)}), 400
+
+    # Gzip text for browsers that accept it: the page and the JSON lists
+    # shrink 4-5x, which a phone on a hotspot notices. Live streams (MJPEG,
+    # server-sent events) and files sent from disk pass through untouched.
+    @app.after_request
+    def _gzip(resp: Response) -> Response:
+        if (resp.status_code != 200 or resp.direct_passthrough or resp.is_streamed
+                or resp.mimetype not in _GZIP_TYPES
+                or "Content-Encoding" in resp.headers):
+            return resp
+        resp.vary.add("Accept-Encoding")
+        body = resp.get_data()
+        if len(body) < _GZIP_MIN_BYTES or not request.accept_encodings["gzip"]:
+            return resp
+        resp.set_data(gzip.compress(body, compresslevel=6))
+        resp.headers["Content-Encoding"] = "gzip"
+        return resp
 
     settings = SettingsStore(db_path)
     bus = EventBus(db_path=db_path, snapshot_dir=snap_path)
@@ -238,8 +274,13 @@ def create_app(*, db_path: str = "homeshield.db",
     def index():
         # The page itself is public: it always renders the shell, then the
         # client-side JS calls /api/me and either shows the login overlay
-        # or the dashboard depending on the session.
-        return render_template("index.html")
+        # or the dashboard depending on the session. "no-cache" plus an ETag:
+        # the browser asks each time, but unless the page changed it gets a
+        # 304 with no body instead of the whole page again.
+        resp = make_response(render_template("index.html"))
+        resp.headers["Cache-Control"] = "no-cache"
+        resp.add_etag(weak=True)
+        return resp.make_conditional(request)
 
     # ===== Authentication ===============================================
 
@@ -251,10 +292,13 @@ def create_app(*, db_path: str = "homeshield.db",
             "must_change_password": bool(row.get("must_change", 0)),
         }
 
-    # Public: the sign-in card shows the default login only while it works.
+    # Public: the sign-in card shows the default login only while it works,
+    # and the board's lamp says whether cameras are being watched. Nothing
+    # about incidents or cameras: a guest on the Wi-Fi can read this.
     @app.route("/api/setup_state")
     def api_setup_state():
-        return jsonify({"default_admin": user_store.default_admin_active()})
+        return jsonify({"default_admin": user_store.default_admin_active(),
+                        "monitoring": manager.monitoring()})
 
     @app.route("/api/login", methods=["POST"])
     def api_login():
@@ -263,12 +307,41 @@ def create_app(*, db_path: str = "homeshield.db",
         password = str(data.get("password", ""))
         if not username or not password:
             return jsonify({"error": "username and password are required"}), 400
+        ip = request.remote_addr or ""
+        wait = throttle.retry_after(username, ip)
+        if wait:
+            return jsonify({"error": "Too many wrong passwords.",
+                            "retry_after": wait}), 429
         row = user_store.verify(username, password)
         if row is None:
             # Same response for unknown user and wrong password.
-            return jsonify({"error": "invalid credentials"}), 401
-        login_session(row)
-        return jsonify({"ok": True, **_user_public(row)})
+            wait = throttle.failed(username, ip)
+            if wait:
+                return jsonify({"error": "Too many wrong passwords.",
+                                "retry_after": wait}), 429
+            # Same for real and unknown usernames, so it reveals nothing.
+            return jsonify({"error": "invalid credentials",
+                            "attempts_left": throttle.remaining(username, ip)}), 401
+        throttle.succeeded(username, ip)
+        previous = user_store.record_login(row["user_id"], ip)
+        login_session(row, remember=_to_bool(data.get("remember", False)))
+        return jsonify({"ok": True, **_user_public(row),
+                        "last_login": previous or None})
+
+    # Public, like the sign-in form: anyone may ask, and the answer is the
+    # same whether or not the username exists, so it can't be used to probe
+    # for accounts. Admins see the request in Settings > Users.
+    @app.route("/api/password_reset_request", methods=["POST"])
+    def api_password_reset_request():
+        data = request.get_json(silent=True) or {}
+        username = str(data.get("username", "")).strip()[:64]
+        ip = request.remote_addr or ""
+        if reset_limiter.retry_after("", ip):
+            return jsonify({"error": "Too many requests. Try again in a few minutes."}), 429
+        reset_limiter.failed("", ip)          # counts every request from this address
+        if username:
+            user_store.request_reset(username)
+        return jsonify({"ok": True})
 
     @app.route("/api/logout", methods=["POST"])
     def api_logout():
@@ -306,14 +379,20 @@ def create_app(*, db_path: str = "homeshield.db",
             current = str(data.get("current_password", ""))
             if user_store.verify(row["username"], current) is None:
                 return jsonify({"error": "Your current password is wrong."}), 400
+        # A "new" password equal to the old one (e.g. keeping admin/admin)
+        # would leave the account exactly as guessable as before.
+        if new_pw.strip().lower() == row["username"].strip().lower():
+            return jsonify({"error": "Choose a password that isn't your username."}), 400
+        if user_store.verify(row["username"], new_pw) is not None:
+            return jsonify({"error": "That's the password you have now. Choose a new one."}), 400
         try:
             user_store.update_password(uid, new_pw)
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
-        # Refresh session to clear must_change.
+        # Refresh session to clear must_change; keep the "Remember me" choice.
         row = user_store.get(uid)
         if row is not None:
-            login_session(row)
+            login_session(row, remember=bool(session.permanent))
         return jsonify({"ok": True})
 
     # ===== User management (admin only) =================================
@@ -527,13 +606,6 @@ def create_app(*, db_path: str = "homeshield.db",
     @require_admin
     def intruder_photo(fname: str):
         return send_from_directory(intruder_dir, fname)
-
-    # Icons are part of the page chrome (login + dashboard); leave them public
-    # so the login screen can render its logo before the user authenticates.
-    if ICON_DIR.is_dir():
-        @app.route("/icons/<path:fname>")
-        def icon_file(fname: str):
-            return send_from_directory(ICON_DIR, fname)
 
     # ===== Events =======================================================
 

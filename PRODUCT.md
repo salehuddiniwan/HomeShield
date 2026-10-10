@@ -55,17 +55,16 @@ The only home CCTV dashboard that runs three production-quality anomaly detector
 
 - Product name: **HomeShield**
 - Logo: `Icon/LOGO.svg` (exists; not locked to current execution)
-- Companion icons in `Icon/` for Detection, Fall, Fire, Face, Camera, Register, Notification
+- Companion icons (Detection, Fall, Fire, Face, Camera, Register, Notification) drawn inline in the page; the source SVGs were moved out of the repo to `../FYPClaude_archive/Icon/`
 - No locked color palette, typography, or visual style — all open for design decisions
 
 ## Evidence on Hand
 
 - `README.md` — complete feature specification, installation guide, hardware tuning table, RTSP brand reference
-- `UML_Diagrams/` — component, class, object, activity, sequence, deployment, use case, and three FSM diagrams (PNG + PlantUML source)
+- UML diagrams (component, class, activity, sequence, deployment, FSMs) are archived outside the repo in `../FYPClaude_archive/UML_Diagrams/`
 - `tests/` — synthetic fall-track pytest suite covering the FSM, per-camera tracker isolation, fire/intruder confirmation, zones, and face matching
-- `homeshield/static/` — current app.css and app.js (the shipped UI)
-- `homeshield/templates/index.html` — single-page dashboard shell
-- `Icon/*.svg` — production icon set
+- `homeshield/templates/index.html` — the shipped UI: one plain HTML page with its CSS and JS inline
+- `homeshield/static/fonts/` — self-hosted Chakra Petch and Rubik
 
 No testimonials, customer quotes, usage metrics, or third-party benchmarks on hand; do not fabricate them.
 

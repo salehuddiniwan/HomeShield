@@ -12,4 +12,3 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 POSE_WEIGHTS_DIR = PROJECT_ROOT / "Fall_Detection" / "weights"
 FIRE_WEIGHTS_DIR = PROJECT_ROOT / "Fire_Detection"
-ICON_DIR = PROJECT_ROOT / "Icon"

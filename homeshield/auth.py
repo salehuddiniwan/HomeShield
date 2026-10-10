@@ -12,8 +12,11 @@ forced to pick a real password before reaching the dashboard.
 from __future__ import annotations
 
 import logging
+import secrets
 import sqlite3
 import threading
+import time
+from collections import deque
 from functools import wraps
 from typing import Any, Optional
 
@@ -33,6 +36,9 @@ DEFAULT_ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = "admin"
 
 MIN_PASSWORD_LENGTH = 4   # keep low so demo / FYP scenarios stay friendly
+
+REMEMBER_DAYS = 30        # "Remember me": signed in for this long
+SESSION_HOURS = 12        # otherwise: until the browser closes, at most this
 
 
 class UserStore:
@@ -64,8 +70,8 @@ class UserStore:
     def list_users(self) -> list[dict[str, Any]]:
         with read_conn(self.db_path) as conn:
             rows = conn.execute(
-                "SELECT user_id, username, role, must_change, created_at "
-                "FROM users ORDER BY user_id ASC"
+                "SELECT user_id, username, role, must_change, created_at, "
+                "last_login_at, reset_requested_at FROM users ORDER BY user_id ASC"
             ).fetchall()
         return [self._row_to_public(r) for r in rows]
 
@@ -163,11 +169,46 @@ class UserStore:
         pw_hash = generate_password_hash(new_password)
         with write_conn(self.db_path) as conn:
             cur = conn.execute(
-                "UPDATE users SET password_hash = ?, must_change = 0 "
-                "WHERE user_id = ?",
+                "UPDATE users SET password_hash = ?, must_change = 0, "
+                "reset_requested_at = NULL WHERE user_id = ?",
                 (pw_hash, int(user_id)),
             )
             return (cur.rowcount or 0) > 0
+
+    # ---- sign-in bookkeeping -------------------------------------------
+
+    def record_login(self, user_id: int, ip: str) -> dict[str, Any]:
+        """Store this sign-in; return the previous one ({at, ip} or {})."""
+        with write_conn(self.db_path) as conn:
+            prev = conn.execute(
+                "SELECT last_login_at, last_login_ip FROM users WHERE user_id = ?",
+                (int(user_id),)).fetchone()
+            conn.execute(
+                "UPDATE users SET last_login_at = ?, last_login_ip = ? WHERE user_id = ?",
+                (time.time(), ip or None, int(user_id)))
+        if prev is None or prev["last_login_at"] is None:
+            return {}
+        return {"at": prev["last_login_at"], "ip": prev["last_login_ip"]}
+
+    def request_reset(self, username: str) -> bool:
+        """Flag "forgot password" for the admins. False if no such user."""
+        with write_conn(self.db_path) as conn:
+            cur = conn.execute(
+                "UPDATE users SET reset_requested_at = ? WHERE username = ?",
+                (time.time(), (username or "").strip()))
+            return (cur.rowcount or 0) > 0
+
+    def set_temporary_password(self, username: str) -> Optional[str]:
+        """Console recovery: a one-off password the user must change at sign-in."""
+        row = self.get_by_username((username or "").strip())
+        if row is None:
+            return None
+        temp = secrets.token_urlsafe(6)
+        self.update_password(row["user_id"], temp)
+        with write_conn(self.db_path) as conn:
+            conn.execute("UPDATE users SET must_change = 1 WHERE user_id = ?",
+                         (row["user_id"],))
+        return temp
 
     def count_admins(self) -> int:
         with read_conn(self.db_path) as conn:
@@ -196,12 +237,75 @@ class UserStore:
             "role": r["role"],
             "must_change_password": bool(r["must_change"]),
             "created_at": r["created_at"],
+            "last_login_at": r["last_login_at"] if "last_login_at" in r.keys() else None,
+            "reset_requested_at": (r["reset_requested_at"]
+                                   if "reset_requested_at" in r.keys() else None),
         }
+
+
+class LoginThrottle:
+    """Slow down password guessing, without a database.
+
+    Five wrong passwords for one username from one address within ten
+    minutes lock that pair for five minutes; twenty from one address (any
+    usernames) lock the address. A correct password clears the count.
+    """
+
+    WINDOW_S, LOCK_S = 600, 300
+    MAX_PER_USER, MAX_PER_IP = 5, 20
+
+    def __init__(self) -> None:
+        self._fails: dict[tuple, deque] = {}
+        self._until: dict[tuple, float] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _keys(username: str, ip: str) -> tuple[tuple, tuple]:
+        return ("user", (username or "").strip().lower(), ip or ""), ("ip", ip or "")
+
+    def retry_after(self, username: str, ip: str) -> int:
+        now = time.time()
+        with self._lock:
+            waits = [self._until.get(k, 0) - now for k in self._keys(username, ip)]
+        return max(0, int(max(waits) + 0.999))
+
+    def failed(self, username: str, ip: str) -> int:
+        """Record a wrong password; return seconds locked (0 if not locked)."""
+        now = time.time()
+        user_key, ip_key = self._keys(username, ip)
+        with self._lock:
+            for key, limit in ((user_key, self.MAX_PER_USER), (ip_key, self.MAX_PER_IP)):
+                q = self._fails.setdefault(key, deque())
+                q.append(now)
+                while q and now - q[0] > self.WINDOW_S:
+                    q.popleft()
+                if len(q) >= limit:
+                    self._until[key] = now + self.LOCK_S
+                    q.clear()
+        return self.retry_after(username, ip)
+
+    def remaining(self, username: str, ip: str) -> int:
+        """Wrong passwords this account may still try before it is paused."""
+        now = time.time()
+        user_key, _ = self._keys(username, ip)
+        with self._lock:
+            recent = sum(1 for t in self._fails.get(user_key, ()) if now - t <= self.WINDOW_S)
+        return max(0, self.MAX_PER_USER - recent)
+
+    def succeeded(self, username: str, ip: str) -> None:
+        user_key, _ = self._keys(username, ip)
+        with self._lock:
+            self._fails.pop(user_key, None)
+            self._until.pop(user_key, None)
 
 
 # ---- session helpers ------------------------------------------------------
 
 def session_user_id() -> Optional[int]:
+    exp = session.get("exp")
+    if exp is not None and time.time() > float(exp):
+        session.clear()               # signed-in time is up
+        return None
     uid = session.get("user_id")
     try:
         return int(uid) if uid is not None else None
@@ -217,13 +321,17 @@ def session_must_change() -> bool:
     return bool(session.get("must_change"))
 
 
-def login_session(user_row: dict[str, Any]) -> None:
+def login_session(user_row: dict[str, Any], remember: bool = False) -> None:
+    """Remember me: a cookie that lasts REMEMBER_DAYS. Otherwise a browser-
+    session cookie that also stops working after SESSION_HOURS."""
     session.clear()
     session["user_id"] = int(user_row["user_id"])
     session["username"] = user_row["username"]
     session["role"] = user_row["role"]
     session["must_change"] = bool(user_row.get("must_change", 0))
-    session.permanent = True
+    session["exp"] = time.time() + (REMEMBER_DAYS * 86400 if remember
+                                    else SESSION_HOURS * 3600)
+    session.permanent = bool(remember)
 
 
 def logout_session() -> None:

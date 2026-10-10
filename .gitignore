@@ -89,5 +89,5 @@ drafts/
 # ---- Literature for the FYP report (kept locally, not versioned) ----
 REFERENCE/
 
-# ---- Impeccable working files ----
-decoded_template.html
+# Session-signing key (created on first run)
+homeshield_secret.key

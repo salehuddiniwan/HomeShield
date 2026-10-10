@@ -370,11 +370,7 @@ Advanced settings (not in the UI yet; set them with `POST /api/settings`):
 
 ## 🏗️ Architecture
 
-HomeShield is a single Flask process that runs one **CameraManager** with one worker thread per camera. Every worker shares a single set of YOLO / InsightFace models on the GPU and publishes results to an async **EventBus** that handles SQLite writes, snapshot encoding, and Server-Sent Events to the browser. The full UML component diagram is below:
-
-![HomeShield Component Diagram](UML_Diagrams/PNG/Component%20Diagram.png)
-
-The matching PlantUML source lives in [`UML_Diagrams/puml/02_component_diagram.puml`](UML_Diagrams/puml/02_component_diagram.puml), and additional UML views (use case, class, object, activity, sequence, deployment, and the three FSM diagrams) are in [`UML_Diagrams/PNG/`](UML_Diagrams/PNG/).
+HomeShield is a single Flask process that runs one **CameraManager** with one worker thread per camera. Every worker shares a single set of YOLO / InsightFace models on the GPU and publishes results to an async **EventBus** that handles SQLite writes, snapshot encoding, and Server-Sent Events to the browser.
 
 Key design choices:
 - **Per-camera worker threads** share one set of YOLO / ONNX models on the GPU. Adding a camera does not duplicate VRAM.
@@ -418,16 +414,6 @@ FYP/
 │   ├── insightface-0.7.3-cp310-cp310-win_amd64.whl
 │   └── insightface-0.7.3-cp311-cp311-win_amd64.whl
 │
-├── Icon/                           # Logo + UI icon set (SVG, 24px grid, currentColor)
-│   ├── LOGO.svg                    #   logo mark (shield + house + lens)
-│   ├── HomeShield.svg              #   logo with wordmark
-│   └── Camera, CameraOff, Capture, Detection, Events, Face, Fall, Fire, Info, Live,
-│       Menu, Notification, Performance, Persons, Register, Settings, Users, Zones (.svg)
-│
-├── UML_Diagrams/                   # PlantUML sources + rendered PNGs
-│   ├── puml/                       #   .puml source files (use case, class, FSMs, …)
-│   └── PNG/                        #   rendered diagrams based on .puml files
-│
 ├── homeshield/                     # The unified Flask app
 │   ├── __init__.py
 │   ├── server.py                   #   Flask API + MJPEG endpoints + SSE
@@ -442,19 +428,18 @@ FYP/
 │   ├── settings.py                 #   hot-reloadable settings store
 │   ├── annotator.py                #   bounding boxes, pose skeleton, labels
 │   ├── db.py                       #   SQLite (WAL mode) connection + schema
-│   ├── paths.py                    #   weights / icon folder locations
+│   ├── paths.py                    #   model weights folder locations
 │   ├── detectors/                  #   detection back-ends (each runnable via python -m)
 │   │   ├── fall/                   #     YOLO pose features + 7-state FSM + drawing
 │   │   ├── fire.py                 #     YOLO fire/smoke wrapper + CLI
 │   │   └── face.py                 #     InsightFace embedding + matching helpers
-│   ├── static/                     #   compiled CSS + JS
-│   │   ├── app.css
-│   │   └── app.js
+│   ├── static/fonts/               #   Chakra Petch + Rubik, served locally (OFL)
 │   └── templates/
-│       └── index.html              #   single-page dashboard UI
+│       └── index.html              #   single-page dashboard UI (plain HTML, CSS and JS)
 │
 ├── tests/                          # pytest suite (+ synthetic skeleton tracks)
 ├── run_homeshield.py               # Entry point (argparse + create_app)
+├── reset-password.bat              # Double-click recovery when no admin can sign in
 ├── pyproject.toml                  # Package metadata + pinned, ABI-consistent deps
 ├── requirements.txt                # Installs the package (-e .[plot,cuda12])
 ├── homeshield.db                   # SQLite event/persons/zones/users store (created on first run)
@@ -472,7 +457,11 @@ FYP/
 
 - **All inference runs locally.** No frames, embeddings, or events ever leave your machine. There is no cloud component, no telemetry, and no third-party API calls during detection — HomeShield only touches the network to pull RTSP/HTTP streams from cameras you explicitly add.
 - **The one opt-in exception: WhatsApp alerts.** If you add Twilio credentials, each new or escalated incident sends a short text (what, which camera, when, confidence) through Twilio to the numbers you list. No images or face data are sent. Leave the Twilio details empty (in Settings and `.env`) to keep HomeShield fully offline. A token saved in Settings sits in `homeshield.db`, so treat that file as a secret (it already holds camera passwords).
-- **Built-in user authentication.** The dashboard ships with a login layer (`homeshield/auth.py`) backed by hashed passwords in the local SQLite DB. On first run you'll be prompted to create the initial admin account; every API and stream endpoint then requires an authenticated session. Change a password from **Account → Settings**, and revoke a leaked session by clearing the `users` / `sessions` rows in `homeshield.db`.
+- **Built-in user authentication.** The dashboard ships with a login layer (`homeshield/auth.py`) backed by hashed passwords in the local SQLite DB. The first run seeds `admin` / `admin` and forces a new password at the first sign-in; every API and stream endpoint then requires an authenticated session. Admins manage accounts and reset passwords in **Settings → Users**.
+  - **Remember me** keeps a device signed in for 30 days; without it, sign-in lasts until the browser closes (12 hours at most).
+  - **Lockout:** 5 wrong passwords for one account from one device within 10 minutes pause that account's sign-in from there for 5 minutes (20 from one device across accounts pause the device).
+  - **Forgot password:** there is no email. The sign-in page sends the request to the admins, who see **RESET REQUESTED** in Settings → Users and give a temporary password. If the only admin forgets, run `python run_homeshield.py --reset-password <username>` on the HomeShield computer; it prints a temporary password that must be changed at sign-in.
+  - Sessions are signed with `homeshield_secret.key`, created beside the database on first run (git-ignored) so sign-ins survive a restart. Delete it to sign everyone out, or set `HOMESHIELD_SECRET` to use your own key.
 - **Face embeddings, not photos**, are used for matching at runtime. The 512-dim ArcFace vectors live in the local SQLite DB. Original enrolment photos are kept in `person_photos/` so you can re-enrol after a model swap.
 - **Intruder snapshots** are stored in `intruder_photos/` on disk. Delete them whenever you want — the entry in the UI will disappear with them. The same applies to event snapshots in `snapshots/`.
 - **Network exposure.** By default the server binds to `0.0.0.0:5000`, so any authenticated user on your local network can reach the dashboard. To restrict it to the same machine, run with `--host 127.0.0.1`. For remote access, **do not expose port 5000 directly to the public internet** — put HomeShield behind a reverse proxy with HTTPS (Caddy, nginx, Cloudflare Tunnel) or a private network (Tailscale, WireGuard).
@@ -502,6 +491,9 @@ Bottlenecks, in practice:
 ---
 
 ## 🔧 Troubleshooting
+
+**Forgot the admin password**
+If another admin can sign in, they can reset it in **Settings → Users**. Otherwise, on the HomeShield computer, double-click **`reset-password.bat`** in the project folder and type the username (Enter means `admin`). It finds HomeShield's Python on its own; if it can't, set `HOMESHIELD_PYTHON` to that `python.exe`, or run `conda activate homeshield` then `python run_homeshield.py --reset-password admin`. Sign in with the temporary password it prints and choose a new one.
 
 **`numpy.dtype size changed, may indicate binary incompatibility`**
 You ended up on NumPy 2.x. Pin back to NumPy 1.x: `pip install "numpy<2.0"`.

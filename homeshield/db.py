@@ -136,6 +136,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE events ADD COLUMN incident_id INTEGER")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_incident "
                  "ON events (incident_id)")
+    ucols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
+    for col, kind in (("last_login_at", "REAL"), ("last_login_ip", "TEXT"),
+                      ("reset_requested_at", "REAL")):
+        if col not in ucols:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {col} {kind}")
 
 
 def connect(db_path: PathArg) -> sqlite3.Connection:
